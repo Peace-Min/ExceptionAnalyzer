@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -15,6 +15,24 @@
     <PackageReference Include="System.Collections.Immutable" Version="7.0.0" />
     <PackageReference Include="System.Configuration.ConfigurationManager" Version="6.0.0" />
     <PackageReference Include="System.Threading.Tasks.Dataflow" Version="7.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Microsoft.CodeAnalysis.Analyzers">
+      <HintPath>..\Lib\Microsoft.CodeAnalysis.Analyzers.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.CodeAnalysis.CSharp.Analyzers">
+      <HintPath>..\Lib\Microsoft.CodeAnalysis.CSharp.Analyzers.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.CodeAnalysis.CSharp.NetAnalyzers">
+      <HintPath>..\Lib\Microsoft.CodeAnalysis.CSharp.NetAnalyzers.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.CodeAnalysis.NetAnalyzers">
+      <HintPath>..\Lib\Microsoft.CodeAnalysis.NetAnalyzers.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Text.Json.SourceGeneration">
+      <HintPath>..\Lib\System.Text.Json.SourceGeneration.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
 </Project>
