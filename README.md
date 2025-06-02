@@ -51,8 +51,11 @@ ExceptionDescriptionMap.Add("UnauthorizedAccessException", "파일에 대한 권
 ExceptionDescriptionMap.Add("ArgumentException", "잘못된 인수가 전달되었을 때 발생합니다.");
 
 📁 출력 예시
-🔧 System.IO.File.Delete()
-📌 예외 추론: IOException | UnauthorizedAccessException | ArgumentException
+ 🔧 System.Security.Principal.WindowsIdentity.GetCurrent()
+        → 예상 예외: SecurityExceptionSecurityException - 보안 제약 조건을 위반했을 때 발생합니다.
+    🔧 System.Enum.HasFlag()
+        → 예상 예외: ArgumentExceptionArgumentException - 인수에 잘못된 값이 전달되었을 때 발생합니다.
+
 
 
 📍 활용 시나리오
