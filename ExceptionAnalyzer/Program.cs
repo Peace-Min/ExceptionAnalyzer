@@ -206,7 +206,54 @@ namespace ExceptionAnalyzerLight
             { "System.Net.Sockets.TcpListener.AcceptTcpClient", "SocketException / ObjectDisposedException" },
             { "System.IO.MemoryStream.Write", "NotSupportedException / ObjectDisposedException" },
             { "System.IO.MemoryStream.Seek", "IOException / NotSupportedException / ObjectDisposedException" },
-            { "System.IO.MemoryStream.Read", "NotSupportedException / ObjectDisposedException" }
+            { "System.IO.MemoryStream.Read", "NotSupportedException / ObjectDisposedException" },
+
+            { "Microsoft.Office.Interop.Excel.Workbooks.Open", "COMException / ArgumentException / InvalidCastException" },
+            { "Microsoft.Office.Interop.Excel._Workbook.Close", "COMException" },
+            { "Microsoft.Office.Interop.Excel._Application.Quit", "COMException" },
+            { "System.Net.NetworkInformation.Ping.Send", "PingException / InvalidOperationException / ArgumentNullException" },
+
+            { "System.Reflection.Assembly.GetTypes", "ReflectionTypeLoadException" },
+            { "System.Reflection.Assembly.GetExecutingAssembly", "None" },
+
+            { "System.Action.Invoke", "NullReferenceException / TargetInvocationException" },
+
+            { "System.Net.IPAddress.ToString", "None" },
+            { "System.Net.Sockets.NetworkStream.Write", "IOException / ObjectDisposedException / NotSupportedException" },
+            { "System.Net.Sockets.NetworkStream.Flush", "IOException / ObjectDisposedException / NotSupportedException" },
+
+            { "System.Int32.ToString", "None" },
+
+            { "System.Collections.Concurrent.ConcurrentDictionary.TryAdd", "ArgumentNullException" },
+
+            { "System.Net.Sockets.TcpListener.Stop", "SocketException / ObjectDisposedException" },
+
+            { "System.Threading.Thread.Abort", "ThreadStateException / SecurityException" },
+
+            { "System.Runtime.Serialization.Formatters.Binary.BinaryFormatter.Serialize", "SerializationException / SecurityException" },
+            { "System.Runtime.Serialization.Formatters.Binary.BinaryFormatter.Deserialize", "SerializationException / SecurityException / ArgumentNullException" },
+
+            { "System.IO.MemoryStream.ToArray", "ObjectDisposedException" },
+
+            { "System.Linq.Enumerable.Cast", "InvalidCastException / ArgumentNullException" },
+
+            { "System.Enum.GetValues", "ArgumentException" },
+
+            { "System.IO.Path.GetFileNameWithoutExtension", "ArgumentException" },
+
+            { "System.Collections.Generic.List.Contains", "ArgumentNullException" },
+
+            { "System.Linq.Enumerable.Range", "ArgumentOutOfRangeException" },
+            { "System.Linq.Enumerable.First", "InvalidOperationException" },
+
+            { "System.Windows.Threading.Dispatcher.BeginInvoke", "ArgumentNullException / InvalidOperationException" },
+
+            { "System.Collections.Generic.List.Find", "ArgumentNullException" },
+            { "System.String.Equals", "None" },
+
+            { "System.Collections.ObjectModel.Collection.Insert", "ArgumentOutOfRangeException / ArgumentNullException" },
+
+            { "System.IO.FileStream.Write", "IOException / ObjectDisposedException / NotSupportedException" },
         };
 
         // 📘 예외 설명 사전
@@ -247,6 +294,11 @@ namespace ExceptionAnalyzerLight
             { "PrivilegeNotHeldException", "필요한 보안 권한이 없는 경우 발생합니다." },
             { "ThreadStateException", "스레드가 잘못된 상태에서 작업을 수행하려고 할 때 발생합니다. 예: 이미 시작된 스레드를 다시 시작하려고 시도한 경우." },
             { "SocketException", "소켓 작업 중 오류가 발생했을 때 발생합니다. 네트워크 오류, 연결 실패, 포트 접근 불가 등 다양한 원인이 있습니다." },
+            { "COMException", "COM 구성 요소에서 오류가 발생했을 때 발생합니다." },
+            { "PingException", "Ping 요청을 보낼 수 없거나 응답을 받을 수 없을 때 발생합니다." },
+            { "ReflectionTypeLoadException", "어셈블리에서 하나 이상의 형식을 로드하지 못했을 때 발생합니다." },
+            { "NullReferenceException", "객체 참조가 null인 상태에서 해당 객체의 멤버에 접근할 때 발생합니다." },
+            { "SerializationException", "직렬화 또는 역직렬화 작업 중 문제가 발생했을 때 발생합니다." },
             { "None"," "}
 
         };
@@ -291,14 +343,14 @@ namespace ExceptionAnalyzerLight
                 // 6. 대상 프로젝트 분석에 필요한 메타데이터 설정
                 var references = new List<PortableExecutableReference>();
 
-                // 6-1. 실행 폴더(.Bin)에서 사용 중인 dll 가져오기.
-                var binPath = Path.Combine(targetDirectory, "bin", "Debug"); // 필요 시 net472 등 서브폴더 포함
-                if (Directory.Exists(binPath))
+                // 6-1. 현재 프로젝트에서 dll 폴더 경로 설정
+                var dllPath = Path.Combine(targetDirectory, "bin", "Debug"); // 필요 시 net472 등 서브폴더 포함
+                if (Directory.Exists(dllPath))
                 {
                     //Console.WriteLine("⚠️ bin 폴더가 존재하지 않습니다. 먼저 빌드가 완료되어야 합니다.");
-                    var dlls = Directory.GetFiles(binPath, "*.dll");
-                    var binReferences = dlls.Select(path => MetadataReference.CreateFromFile(path)).ToList();
-                    references.AddRange(binReferences);
+                    var dlls = Directory.GetFiles(dllPath, "*.dll");
+                    var dllReferences = dlls.Select(path => MetadataReference.CreateFromFile(path)).ToList();
+                    references.AddRange(dllReferences);
                 }
 
                 // ※ 분석 대상 프로젝트에 맞춰서 기본 어셈블리 설정 필요 ※
@@ -395,8 +447,8 @@ namespace ExceptionAnalyzerLight
                                                                 ? $"{trimmed} - {desc}"
                                                                 : $"{trimmed} - (설명 없음)";
                                                             }));
-                                    writer.WriteLine($"        → 예상 예외: {exception}{description}");
-                                    Console.WriteLine($"        → 예상 예외: {exception}{description}");
+                                    writer.WriteLine($"        → 예상 예외: {description}");
+                                    Console.WriteLine($"        → 예상 예외: {description}");
 
                                     if (description.Contains("설명 없음"))
                                     {
@@ -484,8 +536,8 @@ namespace ExceptionAnalyzerLight
                                                             : $"{trimmed} - (설명 없음)";
                                                     }));
 
-                            writer.WriteLine($"{indent}    → 예상 예외: {exception}{description}");
-                            Console.WriteLine($"{indent}    → 예상 예외: {exception}{description}");
+                            writer.WriteLine($"{indent}    → 예상 예외: {description}");
+                            Console.WriteLine($"{indent}    → 예상 예외: {description}");
 
                             if (description.Contains("설명 없음"))
                             {
