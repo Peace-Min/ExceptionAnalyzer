@@ -2,6 +2,14 @@ API .xml 매핑
  ※ “Roslyn이 제공하는 메서드 시그니처(DocumentationCommentId)는 실제 XML 문서에서 사용되는 멤버 이름 포맷과 일치하지 않는 경우가 많아, 단순한 ID 매칭으로는 정확한 문서 추적이 어렵다.”
  => 해당 프로젝트 폐기 
 
+// Roslyn ID vs XML ID mismatch due to interface indirection or generic erasure
+
+// 구조적으로 문서화 ID와 Roslyn의 메서드 ID가 다름 (ex: List<T>.IndexOf vs IList.IndexOf)
+
+// XML은 실제 구현 메서드가 아닌 인터페이스/추상 클래스 기준으로 작성되어 있음
+
+// 제네릭, 인터페이스, 오버로드, 명시적 구현 등으로 인해 Roslyn의 ID와 XML name 불일치 발생
+
 # ExceptionAnalyzerLight
 
 **Try-Catch 구문의 신뢰성 검출 자동화 도구**
