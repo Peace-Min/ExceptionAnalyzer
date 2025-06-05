@@ -1,3 +1,7 @@
+API .xml 매핑
+ ※ “Roslyn이 제공하는 메서드 시그니처(DocumentationCommentId)는 실제 XML 문서에서 사용되는 멤버 이름 포맷과 일치하지 않는 경우가 많아, 단순한 ID 매칭으로는 정확한 문서 추적이 어렵다.”
+ => 해당 프로젝트 폐기 
+
 # ExceptionAnalyzerLight
 
 **Try-Catch 구문의 신뢰성 검출 자동화 도구**
@@ -74,4 +78,6 @@ System.Reflection
 📌 향후 계획
  API LLM 학습
  대상 프로젝트 자동 환경설정
-
+ API .xml 매핑
+ ※ “Roslyn이 제공하는 메서드 시그니처(DocumentationCommentId)는 실제 XML 문서에서 사용되는 멤버 이름 포맷과 일치하지 않는 경우가 많아, 단순한 ID 매칭으로는 정확한 문서 추적이 어렵다.”
+ => 해당 프로젝트 폐기 
