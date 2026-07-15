@@ -17,15 +17,16 @@
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
-            <TextBox x:Name="PathBox" Grid.Column="0" IsReadOnly="True"
-                     VerticalContentAlignment="Center" Padding="4,0" Height="28"/>
+            <TextBox x:Name="PathBox" Grid.Column="0"
+                     VerticalContentAlignment="Center" Padding="4,0" Height="28"
+                     ToolTip="분석할 프로젝트 폴더 경로 (직접 입력·붙여넣기 또는 [폴더 선택])"/>
             <Button Grid.Column="1" Content="폴더 선택" Width="90" Height="28"
                     Margin="8,0,0,0" Click="PickFolder_Click"/>
         </Grid>
 
         <!-- Row 1: 분석 시작 + 결과 폴더 열기 -->
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
-            <Button Content="분석 시작" Width="110" Height="30" Click="Analyze_Click"/>
+            <Button Content="분석 + 소스 자동수정" Width="170" Height="30" Click="Analyze_Click"/>
             <Button Content="결과 폴더 열기" Width="130" Height="30" Margin="8,0,0,0"
                     Click="OpenResult_Click"/>
         </StackPanel>
