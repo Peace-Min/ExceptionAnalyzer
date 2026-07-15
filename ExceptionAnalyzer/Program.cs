@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis;
 using System.Xml.Linq;
 using System;
+using System.IO;
 using System.Linq;
 using Microsoft.CodeQuality.Analyzers.ApiDesignGuidelines;
 using System.Reflection;
@@ -22,6 +23,9 @@ internal class Program
     private static Dictionary<string, string> methodExceptionList = new Dictionary<string, string>();
     private static readonly string NET_FRAMEWORK_PATH = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\ko";
     private static Dictionary<string, ApiDocumentation> _apiDocCache = new Dictionary<string, ApiDocumentation>();
+
+    // 분석 로그 싱크: 콘솔(헤드리스) 또는 WPF 창으로 라우팅
+    public static Action<string> Log = Console.WriteLine;
 
     private static void LoadXmlDocumentation()
     {
@@ -59,25 +63,26 @@ internal class Program
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"XML 문서 로드 중 오류 발생: {xmlFile}");
-                Console.WriteLine(ex.Message);
+                Log($"XML 문서 로드 중 오류 발생: {xmlFile}");
+                Log(ex.Message);
             }
         }
     }
 
-    private static async Task Main(string[] args)
+    // 분석 진입점: 하드코딩 경로 대신 인자로 받은 폴더를 분석한다. 백그라운드 스레드에서 반복 호출해도 안전.
+    public static void AnalyzeDirectory(string targetDirectory)
     {
-        if (args.Length > 0 && args[0] == "--selftest") { RunSelfTest(); return; }
-        if (args.Length > 0 && args[0] == "--selftest-xml") { RunSelfTestXml(); return; }
+        // 반복 호출 안전: 파일별 예외 목록 상태 초기화
+        methodExceptionList = new Dictionary<string, string>();
 
-        // XML 문서 로드
-        Console.WriteLine("📚 .NET Framework XML 문서 로딩 중...");
-        LoadXmlDocumentation();
-        Console.WriteLine($"✅ {_apiDocCache.Count}개의 API 문서 로드 완료");
+        // XML 문서 로드 (최초 1회)
+        if (_apiDocCache.Count == 0)
+        {
+            Log("📚 .NET Framework XML 문서 로딩 중...");
+            LoadXmlDocumentation();
+            Log($"✅ {_apiDocCache.Count}개의 API 문서 로드 완료");
+        }
 
-        // 1. 분석할 디렉토리 지정 
-        // ※ 분석 대상 프로젝트 경로 설정※
-        var targetDirectory = @"C:\\Users\\CEO\\Desktop\\ㅄㅊ\\StatusDisplayEquipment\\StatusDisplayEquipment\\StatusDisplayEquipment";//string.Empty; 
         var lastFolderName = new DirectoryInfo(targetDirectory).Name;
 
         // 2. 출력 파일 경로 지정
@@ -88,7 +93,7 @@ internal class Program
         using var writer = new StreamWriter(outputPath);
         using var exceptionWriter = new StreamWriter(unregisteredExceptionMapPath);
 
-        Console.WriteLine($"🔍 디렉토리 분석 시작: {targetDirectory}");
+        Log($"🔍 디렉토리 분석 시작: {targetDirectory}");
 
         // 4. 디렉토리 내 모든 .cs 파일 재귀적으로 수집
         var csFiles = Directory.GetFiles(targetDirectory, "*.cs", SearchOption.AllDirectories);
@@ -96,14 +101,14 @@ internal class Program
         // 5. 각 파일에 대해 반복 수행
         foreach (var file in csFiles)
         {
-            // 5-1. 파일 내용을 문자열로 읽어옴 
-            var code = await File.ReadAllTextAsync(file);
+            // 5-1. 파일 내용을 문자열로 읽어옴 (백그라운드 스레드에서 동기 실행)
+            var code = File.ReadAllText(file);
 
             // 5-2. Roslyn으로 C# 구문 트리(SyntaxTree) 생성
             var tree = CSharpSyntaxTree.ParseText(code);
 
             // 5-3. 구문 트리에서 루트 노드 추출 (SyntaxNode)
-            var root = await tree.GetRootAsync();
+            var root = tree.GetRoot();
 
             // 5-4. 모든 try 블록을 AST에서 수집
             var tryStatements = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
@@ -166,7 +171,7 @@ internal class Program
                 if (!methodCalls.Any()) continue; // 🔥 메서드 호출 없으면 출력 생략
 
                 var message = $"📄 파일: {file}, 줄: {line} → try 블록 내부 API 호출:";
-                Console.WriteLine(message);
+                Log(message);
                 writer.WriteLine(message);
 
 
@@ -231,14 +236,14 @@ internal class Program
                         foreach (var exception in exceptionList)
                         {
                             writer.WriteLine($"        → 예상 예외: {exception.Key}");
-                            Console.WriteLine($"        → 예상 예외: {exception.Key}");
+                            Log($"        → 예상 예외: {exception.Key}");
                         }
                     }
                     else
                     {
                         var nonFrameworkCall = $"프레임워크에 등록되지 않은 API : {methodSymbol.ContainingNamespace}.{methodSymbol.ContainingType.Name}.{methodSymbol.Name}";
                         writer.WriteLine($"    🔧 {nonFrameworkCall}()");
-                        Console.WriteLine($"    🔧 {nonFrameworkCall}()");
+                        Log($"    🔧 {nonFrameworkCall}()");
 
                         // 해당 메서드 정의 위치를 찾음 (재귀 분석용)
                         var methodDeclSyntax = methodSymbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() as MethodDeclarationSyntax;
@@ -258,9 +263,7 @@ internal class Program
         // 결과 저장 및 종료 메시지 출력
         writer.Flush();
         exceptionWriter.Flush();
-        Console.WriteLine("📄 결과 저장 완료: " + outputPath);
-        Console.WriteLine("아무 키나 누르면 종료됩니다...");
-        Console.ReadKey();
+        Log("📄 결과 저장 완료: " + outputPath);
     }
 
     private static void AnalyzeInternalMethod(MethodDeclarationSyntax methodSyntax, SemanticModel semanticModel, StreamWriter writer, StreamWriter exceptionWriter, string callerFullName, int depth)
@@ -283,7 +286,7 @@ internal class Program
             var methodFullName = $"{innerSymbol.ContainingNamespace}.{innerSymbol.ContainingType.Name}.{innerSymbol.Name}";
 
             writer.WriteLine($"{indent}🔄 내부 호출: {methodFullName}()");
-            Console.WriteLine($"{indent}🔄 내부 호출: {methodFullName}()");
+            Log($"{indent}🔄 내부 호출: {methodFullName}()");
 
             // 프레임워크 API 예외 추론
             var ns = innerSymbol.ContainingNamespace?.ToDisplayString();
@@ -301,7 +304,7 @@ internal class Program
                 {
 
                     writer.WriteLine($"    🔧 {methodFullName}() - 문서화되지 않은 메서드");
-                    Console.WriteLine($"    🔧 {methodFullName}() - 문서화되지 않은 메서드");
+                    Log($"    🔧 {methodFullName}() - 문서화되지 않은 메서드");
                     continue;
                 }
 
@@ -325,14 +328,14 @@ internal class Program
                     else
                     {
                         writer.WriteLine("        📌 문서화된 예외 정보 없음");
-                        Console.WriteLine("        📌 문서화된 예외 정보 없음");
+                        Log("        📌 문서화된 예외 정보 없음");
                     }
                 }
 
                 foreach (var exception in exceptionList)
                 {
                     writer.WriteLine($"        → 예상 예외: {exception.Key}");
-                    Console.WriteLine($"        → 예상 예외: {exception.Key}");
+                    Log($"        → 예상 예외: {exception.Key}");
                 }
             }
             else
@@ -416,7 +419,49 @@ internal class Program
         return idx >= 0 ? fullName.Substring(idx + 1) : fullName;
     }
 
-    private static void Emit(StreamWriter writer, string msg) { writer.WriteLine(msg); Console.WriteLine(msg); }
+    private static void Emit(StreamWriter writer, string msg) { writer.WriteLine(msg); Log(msg); }
+
+    // 헤드리스 게이트: PASS면 0, FAIL이면 1 반환. 전체 상세는 <BaseDir>\selftest-result.txt에 기록.
+    // mode 는 "--selftest" 또는 "--selftest-xml". 기존 RunSelfTest/RunSelfTestXml 로직·판정 기준을 그대로 재사용.
+    public static int RunSelfTestHeadless(string mode)
+    {
+        var sb = new StringBuilder();
+        var sw = new StringWriter(sb);
+        var originalOut = Console.Out;
+        var originalLog = Log;
+        Console.SetOut(sw);
+        Log = Console.WriteLine; // Emit/Log 출력도 리다이렉트된 콘솔(=StringBuilder)로 수집
+        try
+        {
+            if (mode == "--selftest-xml") RunSelfTestXml();
+            else RunSelfTest();
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine("SELFTEST EXCEPTION: " + ex);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Log = originalLog;
+        }
+
+        var text = sb.ToString();
+        // 기존 판정 기준 그대로: 최종 PASS 라인 존재 여부로 결정
+        var passToken = mode == "--selftest-xml" ? "SELFTEST-XML PASS" : "SELFTEST PASS";
+        bool pass = text.Contains(passToken);
+
+        try
+        {
+            var resultPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "selftest-result.txt");
+            File.WriteAllText(resultPath, text);
+        }
+        catch { /* 파일 기록 실패는 무시 */ }
+
+        try { Console.WriteLine(text); } catch { /* 콘솔 없을 수 있음 */ }
+
+        return pass ? 0 : 1;
+    }
 
     private static void RunSelfTest()
     {
