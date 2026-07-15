@@ -14,6 +14,24 @@ namespace ExceptionAnalyzer
                 int code = global::Program.RunSelfTestHeadless(e.Args[0]);
                 Shutdown(code); return;
             }
+            if (e.Args.Length > 0 && e.Args[0] == "--selftest-fix")
+            {
+                int code = global::Program.RunSelfTestFix();
+                Shutdown(code); return;
+            }
+            if (e.Args.Length >= 2 && e.Args[0] == "--fix")
+            {
+                bool apply = e.Args.Contains("--apply");
+                try
+                {
+                    global::Program.Log = Console.WriteLine;
+                    var res = global::Program.RunFix(e.Args[1], apply);
+                    global::Program.WriteFixReport(res, apply);
+                    Shutdown(0);
+                }
+                catch (Exception ex) { Console.WriteLine("FIX ERROR: " + ex); Shutdown(1); }
+                return;
+            }
             if (e.Args.Length >= 2 && e.Args[0] == "--analyze")
             {
                 try { global::Program.Log = Console.WriteLine; global::Program.AnalyzeDirectory(e.Args[1]); Shutdown(0); }
