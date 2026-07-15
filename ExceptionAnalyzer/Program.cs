@@ -6,6 +6,7 @@ using System;
 using System.Linq;
 using Microsoft.CodeQuality.Analyzers.ApiDesignGuidelines;
 using System.Reflection;
+using System.Text;
 
 
 public class ApiDocumentation
@@ -18,7 +19,7 @@ public class ApiDocumentation
 
 internal class Program
 {
-    private static List<string> methodExceptionList = new List<string>();
+    private static Dictionary<string, string> methodExceptionList = new Dictionary<string, string>();
     private static readonly string NET_FRAMEWORK_PATH = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\ko";
     private static Dictionary<string, ApiDocumentation> _apiDocCache = new Dictionary<string, ApiDocumentation>();
 
@@ -66,6 +67,9 @@ internal class Program
 
     private static async Task Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--selftest") { RunSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "--selftest-xml") { RunSelfTestXml(); return; }
+
         // XML 문서 로드
         Console.WriteLine("📚 .NET Framework XML 문서 로딩 중...");
         LoadXmlDocumentation();
@@ -167,7 +171,7 @@ internal class Program
 
 
                 // 9-3. 각 호출에 대해 의미 정보 추출
-                methodExceptionList = new List<string>();
+                methodExceptionList = new Dictionary<string, string>();
                 foreach (var call in methodCalls)
                 {
                     var symbolInfo = semanticModel.GetSymbolInfo(call);
@@ -184,16 +188,13 @@ internal class Program
                     
                     if (ns.StartsWith("System") || ns.StartsWith("Microsoft"))
                     {
-                        // _apiDocCache에서 메서드 이름을 포함한 모든 키를 찾음
-                        var matchedDocs = _apiDocCache
-                                                     .Where(kvp =>
-                                                     {
-                                                         var fullMethodSignature = kvp.Key;
-                                                         var nameOnly = fullMethodSignature.Split('.').Last().Split('(')[0]; // 예: IndexOf
-                                                         return nameOnly == methodName;
-                                                     })
-                                                     .Select(kvp => kvp.Value)
-                                                     .ToList();
+                        // ③ 정확한 문서 주석 ID로 일치하는 오버로드만 조회 (이름 충돌 과매칭 제거)
+                        var docId = methodSymbol.GetDocumentationCommentId();
+                        List<ApiDocumentation> matchedDocs;
+                        if (docId != null && _apiDocCache.TryGetValue(docId, out var exactDoc))
+                            matchedDocs = new List<ApiDocumentation> { exactDoc };
+                        else
+                            matchedDocs = new List<ApiDocumentation>();
 
                         if (matchedDocs.Count == 0)
                         {
@@ -216,10 +217,7 @@ internal class Program
                             {
                                 foreach (var exception in doc.Exceptions)
                                 {
-                                    if (!methodExceptionList.Contains(exception.Key))
-                                    {
-                                        methodExceptionList.Add(exception.Key);
-                                    }
+                                    methodExceptionList[exception.Key] = exception.Value;
 
                                     if (!exceptionList.Any(item => item.Key == exception.Key))
                                     {
@@ -253,13 +251,7 @@ internal class Program
 
                 }
 
-                writer.WriteLine($"🐙 최종 Exception");
-                Console.WriteLine($"🐙 최종 Exception");
-                foreach (var exception in methodExceptionList)
-                {
-                    writer.WriteLine($"        → 예상 예외: {exception}");
-                    Console.WriteLine($"        → 예상 예외: {exception}");
-                }
+                EmitOrderedCatches(writer, compilation, methodExceptionList);
             }
         }
 
@@ -297,15 +289,13 @@ internal class Program
             var ns = innerSymbol.ContainingNamespace?.ToDisplayString();
             if (ns.StartsWith("System") || ns.StartsWith("Microsoft"))
             {
-                var matchedDocs = _apiDocCache
-                                                     .Where(kvp =>
-                                                     {
-                                                         var fullMethodSignature = kvp.Key;
-                                                         var nameOnly = fullMethodSignature.Split('.').Last().Split('(')[0]; // 예: IndexOf
-                                                         return nameOnly == methodName;
-                                                     })
-                                                     .Select(kvp => kvp.Value)
-                                                     .ToList();
+                // ③ 정확한 문서 주석 ID로 일치하는 오버로드만 조회 (이름 충돌 과매칭 제거)
+                var docId = innerSymbol.GetDocumentationCommentId();
+                List<ApiDocumentation> matchedDocs;
+                if (docId != null && _apiDocCache.TryGetValue(docId, out var exactDoc))
+                    matchedDocs = new List<ApiDocumentation> { exactDoc };
+                else
+                    matchedDocs = new List<ApiDocumentation>();
 
                 if (matchedDocs.Count == 0)
                 {
@@ -324,10 +314,7 @@ internal class Program
                     {
                         foreach (var exception in doc.Exceptions)
                         {
-                            if (!methodExceptionList.Contains(exception.Key))
-                            {
-                                methodExceptionList.Add(exception.Key);
-                            }
+                            methodExceptionList[exception.Key] = exception.Value;
 
                             if (!exceptionList.Any(item => item.Key == exception.Key))
                             {
@@ -358,5 +345,206 @@ internal class Program
                 }
             }
         }
+    }
+
+    private static void EmitOrderedCatches(StreamWriter writer, CSharpCompilation compilation, Dictionary<string, string> exMap)
+    {
+        // ⑥ remove ONLY System.Exception (catch-all). Keep SystemException/ApplicationException etc.
+        var items = exMap.Where(kv => kv.Key != "System.Exception").ToList();
+
+        if (items.Count == 0)
+        {
+            Emit(writer, "🐙 catch 권장: ⚠️ 추론된 구체 예외 없음 — 수동 검토 필요");
+            return;
+        }
+
+        // resolve each type to a symbol via the same compilation
+        int Depth(INamedTypeSymbol s) { int d = 0; var t = s; while (t != null) { d++; t = t.BaseType; } return d; }
+        var resolved = items
+            .Select(kv => new { Name = kv.Key, Desc = kv.Value, Sym = compilation.GetTypeByMetadataName(kv.Key) })
+            .Where(x => x.Sym != null)
+            // ① derived-before-base: single-inheritance ⇒ a subtype is strictly deeper ⇒ depth DESC is a valid catch order
+            .OrderByDescending(x => Depth(x.Sym!))
+            .ThenBy(x => x.Name, StringComparer.Ordinal)
+            .ToList();
+        var unresolved = items
+            .Where(kv => compilation.GetTypeByMetadataName(kv.Key) == null)
+            .Select(kv => kv.Key)
+            .ToList();
+
+        // ⑤ Roslyn self-compile validation over the RESOLVED, ordered set
+        var orderedNames = resolved.Select(x => x.Name).ToList();
+        var validation = ValidateCatchOrder(orderedNames, compilation);
+
+        Emit(writer, "🐙 catch 권장 순서 (파생 → 기반, Exception 제외):");
+        int i = 1;
+        foreach (var x in resolved)
+            Emit(writer, $"    {i++}. {ShortTypeName(x.Name)} : {x.Desc}");
+        if (unresolved.Count > 0)
+            Emit(writer, $"    ⚠️ 해석 불가(수동 확인 — 외부 라이브러리/미빌드): {string.Join(", ", unresolved.Select(ShortTypeName))}");
+        Emit(writer, validation);
+
+        Emit(writer, "── 붙여넣기용 스켈레톤 ──────────────────────");
+        foreach (var x in resolved)
+            Emit(writer, $"catch ({ShortTypeName(x.Name)} ex) {{ /* {x.Desc} */ }}");
+    }
+
+    // self-compile the synthesized try/catch; report CS0160 (already-caught) / CS0161 presence
+    private static string ValidateCatchOrder(List<string> orderedFullNames, CSharpCompilation compilation)
+    {
+        if (orderedFullNames.Count == 0) return "        ✅ 셀프 컴파일 검증: 대상 없음";
+        var sb = new StringBuilder();
+        sb.AppendLine("class __CatchValidator__ { void __M__() { try { }");
+        foreach (var t in orderedFullNames) sb.AppendLine($"catch (global::{t}) {{ }}");
+        sb.AppendLine("} }");
+        var vtree = CSharpSyntaxTree.ParseText(sb.ToString());
+        var vcomp = CSharpCompilation.Create("CatchValidation")
+            .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+            .AddReferences(compilation.References)
+            .AddSyntaxTrees(vtree);
+        var errors = vcomp.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error && (d.Id == "CS0160" || d.Id == "CS0161"))
+            .ToList();
+        if (errors.Count == 0)
+            return "        ✅ 셀프 컴파일 검증 통과 (CS0160/CS0161 없음)";
+        return "        ⚠️ 셀프 컴파일 검증 실패: " + string.Join(", ", errors.Select(d => d.Id + " " + d.GetMessage()));
+    }
+
+    private static string ShortTypeName(string fullName)
+    {
+        var idx = fullName.LastIndexOf('.');
+        return idx >= 0 ? fullName.Substring(idx + 1) : fullName;
+    }
+
+    private static void Emit(StreamWriter writer, string msg) { writer.WriteLine(msg); Console.WriteLine(msg); }
+
+    private static void RunSelfTest()
+    {
+        var net472Path = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\";
+        var refs = new[] { "mscorlib.dll", "System.dll", "System.Core.dll" }
+            .Select(n => (MetadataReference)MetadataReference.CreateFromFile(System.IO.Path.Combine(net472Path, n)));
+        var comp = CSharpCompilation.Create("SelfTest").AddReferences(refs);
+
+        // known set INCLUDING System.Exception (must be filtered) + a derived/base pair (order check)
+        var exMap = new Dictionary<string, string>
+        {
+            ["System.Exception"] = "최상위(반드시 제외되어야 함)",
+            ["System.ArgumentException"] = "인수 오류",
+            ["System.ArgumentNullException"] = "인수 null (ArgumentException의 자식)",
+            ["System.IO.IOException"] = "입출력 오류",
+        };
+
+        // capture EmitOrderedCatches output via an in-memory StreamWriter
+        var ms = new System.IO.MemoryStream();
+        var writer = new StreamWriter(ms) { AutoFlush = true };
+        EmitOrderedCatches(writer, comp, exMap);
+        writer.Flush();
+        var output = System.Text.Encoding.UTF8.GetString(ms.ToArray());
+
+        bool exceptionFiltered = !output.Contains("catch (Exception ");
+        int idxNull = output.IndexOf("ArgumentNullException", StringComparison.Ordinal);
+        int idxArg = output.IndexOf("catch (ArgumentException", StringComparison.Ordinal);
+        bool derivedFirst = idxNull >= 0 && idxArg >= 0 && idxNull < idxArg;
+        bool selfValidated = output.Contains("셀프 컴파일 검증 통과");
+
+        Console.WriteLine("===== SELFTEST OUTPUT =====");
+        Console.WriteLine(output);
+        Console.WriteLine("===========================");
+        Console.WriteLine($"[1] System.Exception 제거: {(exceptionFiltered ? "PASS" : "FAIL")}");
+        Console.WriteLine($"[2] 파생 우선(ArgumentNullException < ArgumentException): {(derivedFirst ? "PASS" : "FAIL")}");
+        Console.WriteLine($"[3] 셀프 컴파일 검증 통과 출력: {(selfValidated ? "PASS" : "FAIL")}");
+        Console.WriteLine((exceptionFiltered && derivedFirst && selfValidated) ? "SELFTEST PASS" : "SELFTEST FAIL");
+    }
+
+    // ②③④ 핵심 XML 조회 경로 실증: GetDocumentationCommentId ↔ _apiDocCache 키 매칭 + ko 한글 메시지 통과
+    private static void RunSelfTestXml()
+    {
+        // 1. 실제 ko XML 로드
+        LoadXmlDocumentation();
+        Console.WriteLine($"📚 _apiDocCache.Count = {_apiDocCache.Count}");
+        if (_apiDocCache.Count == 0)
+        {
+            Console.WriteLine("SELFTEST-XML FAIL: XML 미로드");
+            return;
+        }
+
+        // 2. 인메모리 소스 파싱
+        var source = "class __T__ { void __M__() { try { int a = int.Parse(\"1\"); string s = System.IO.File.ReadAllText(\"a.txt\"); } catch { } } }";
+        var tree = CSharpSyntaxTree.ParseText(source);
+
+        // 3. net472 참조로 컴파일 생성 + SemanticModel 확보
+        var net472Path = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\";
+        var refs = new[] { "mscorlib.dll", "System.dll", "System.Core.dll", "System.Xml.dll" }
+            .Select(n => (MetadataReference)MetadataReference.CreateFromFile(System.IO.Path.Combine(net472Path, n)));
+        var comp = CSharpCompilation.Create("SelfTestXml").AddReferences(refs).AddSyntaxTrees(tree);
+        var semanticModel = comp.GetSemanticModel(tree);
+
+        // 판정 플래그 (int.Parse 기준)
+        bool parseDocFound = false;
+        bool parseFormatKey = false;
+        bool parseDescNonEmpty = false;
+        bool readAllTextDocFound = false;
+
+        // 4. try 블록 내부 호출 순회
+        var tryStmt = tree.GetRoot().DescendantNodes().OfType<TryStatementSyntax>().FirstOrDefault();
+        if (tryStmt == null)
+        {
+            Console.WriteLine("SELFTEST-XML FAIL: try 블록 없음");
+            return;
+        }
+
+        var calls = tryStmt.Block.DescendantNodes().OfType<InvocationExpressionSyntax>().ToList();
+        Console.WriteLine("===== SELFTEST-XML 조회 결과 =====");
+        foreach (var call in calls)
+        {
+            var sym = semanticModel.GetSymbolInfo(call).Symbol as IMethodSymbol;
+            if (sym == null)
+            {
+                Console.WriteLine($"  (심볼 해석 실패: {call})");
+                continue;
+            }
+
+            var methodName = sym.Name;
+            var docId = sym.GetDocumentationCommentId();
+            Console.WriteLine($"  호출: {sym.ContainingType.Name}.{methodName}");
+            Console.WriteLine($"    docId = {docId ?? "(null)"}");
+
+            bool found = docId != null && _apiDocCache.TryGetValue(docId, out var doc);
+            Console.WriteLine($"    _apiDocCache 조회: {(found ? "FOUND" : "NOT FOUND")}");
+
+            ApiDocumentation? matchedDoc = null;
+            if (found) { _apiDocCache.TryGetValue(docId!, out matchedDoc); }
+
+            if (found && matchedDoc != null)
+            {
+                Console.WriteLine($"    Exceptions.Count = {matchedDoc.Exceptions.Count}");
+                var first = matchedDoc.Exceptions.FirstOrDefault();
+                if (matchedDoc.Exceptions.Count > 0)
+                    Console.WriteLine($"    첫 예외 → {first.Key} : {first.Value}");
+            }
+
+            if (methodName == "Parse" && sym.ContainingType.Name == "Int32")
+            {
+                parseDocFound = found;
+                if (found && matchedDoc != null)
+                {
+                    parseFormatKey = matchedDoc.Exceptions.ContainsKey("System.FormatException");
+                    if (parseFormatKey)
+                        parseDescNonEmpty = !string.IsNullOrWhiteSpace(matchedDoc.Exceptions["System.FormatException"]);
+                }
+            }
+            if (methodName == "ReadAllText" && sym.ContainingType.Name == "File")
+            {
+                readAllTextDocFound = found;
+            }
+        }
+        Console.WriteLine("=================================");
+
+        // 5~6. 판정 (int.Parse만 필수, File.ReadAllText는 참고용)
+        Console.WriteLine($"[a] int.Parse docId 조회 성공: {(parseDocFound ? "PASS" : "FAIL")}");
+        Console.WriteLine($"[b] System.FormatException 키 존재: {(parseFormatKey ? "PASS" : "FAIL")}");
+        Console.WriteLine($"[c] 설명(한글) 비어있지 않음: {(parseDescNonEmpty ? "PASS" : "FAIL")}");
+        Console.WriteLine($"[참고] File.ReadAllText docId 조회: {(readAllTextDocFound ? "FOUND" : "NOT FOUND")}");
+        Console.WriteLine((parseDocFound && parseFormatKey && parseDescNonEmpty) ? "SELFTEST-XML PASS" : "SELFTEST-XML FAIL");
     }
 }
