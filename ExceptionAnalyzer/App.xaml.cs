@@ -22,10 +22,11 @@ namespace ExceptionAnalyzer
             if (e.Args.Length >= 2 && e.Args[0] == "--fix")
             {
                 bool apply = e.Args.Contains("--apply");
+                bool sourceOnly = e.Args.Contains("--source-only");
                 try
                 {
                     global::Program.Log = Console.WriteLine;
-                    var res = global::Program.RunFix(e.Args[1], apply);
+                    var res = global::Program.RunFix(e.Args[1], apply, sourceOnly);
                     global::Program.WriteFixReport(res, apply);
                     Shutdown(0);
                 }

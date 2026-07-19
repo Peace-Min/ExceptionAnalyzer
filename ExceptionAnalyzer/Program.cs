@@ -26,6 +26,7 @@ internal class Program
     private static readonly string NET_FRAMEWORK_PATH = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\ko";
     private static Dictionary<string, ApiDocumentation> _apiDocCache = new Dictionary<string, ApiDocumentation>();
     private static bool _msBuildRegistered;
+    private static bool _codePagesRegistered;
 
     // 분석 로그 싱크: 콘솔(헤드리스) 또는 WPF 창으로 라우팅
     public static Action<string> Log = Console.WriteLine;
@@ -143,6 +144,55 @@ internal class Program
         Log(text);
     }
 
+    // CP949(EUC-KR) 등 코드페이지 인코딩 사용을 위해 provider 를 1회만 등록 (net6/net8 in-box 아님).
+    private static void EnsureCodePagesRegistered()
+    {
+        if (_codePagesRegistered) return;
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        _codePagesRegistered = true;
+    }
+
+    // FIX 5: obj/bin/.git 및 생성 파일(.g.cs/.Designer.cs 등)은 수정·분석 대상에서 제외.
+    private static bool IsExcludedSourcePath(string path)
+    {
+        var norm = path.Replace('/', '\\');
+        foreach (var seg in new[] { "\\obj\\", "\\bin\\", "\\.git\\" })
+            if (norm.Contains(seg, StringComparison.OrdinalIgnoreCase)) return true;
+        var name = Path.GetFileName(norm);
+        if (name.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
+            name.EndsWith(".g.i.cs", StringComparison.OrdinalIgnoreCase) ||
+            name.EndsWith(".Designer.cs", StringComparison.OrdinalIgnoreCase) ||
+            name.EndsWith(".generated.cs", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("TemporaryGeneratedFile_", StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    // FIX 4: BOM/코드페이지/EOL 을 감지해 원본 그대로 되쓰기 위한 (text, encoding, eol) 반환.
+    private static (string text, Encoding encoding, string eol) ReadSourcePreserving(string file)
+    {
+        var bytes = File.ReadAllBytes(file);
+        Encoding enc;
+        string text;
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        { enc = new UTF8Encoding(true); text = enc.GetString(bytes, 3, bytes.Length - 3); }
+        else if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        { enc = new UnicodeEncoding(false, true); text = Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2); }
+        else if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        { enc = new UnicodeEncoding(true, true); text = Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2); }
+        else
+        {
+            try { text = new UTF8Encoding(false, true).GetString(bytes); enc = new UTF8Encoding(false); }
+            catch (DecoderFallbackException)
+            {
+                EnsureCodePagesRegistered();
+                var cp949 = Encoding.GetEncoding(949); // requires CodePagesEncodingProvider registration
+                text = cp949.GetString(bytes); enc = cp949;
+            }
+        }
+        var eol = text.Contains("\r\n") ? "\r\n" : "\n";
+        return (text, enc, eol);
+    }
+
     private static void LoadXmlDocumentation()
     {
         foreach (var xmlFile in Directory.GetFiles(NET_FRAMEWORK_PATH, "*.xml"))
@@ -190,6 +240,7 @@ internal class Program
     {
         // 반복 호출 안전: 파일별 예외 목록 상태 초기화
         methodExceptionList = new Dictionary<string, string>();
+        EnsureCodePagesRegistered();
 
         // XML 문서 로드 (최초 1회)
         if (_apiDocCache.Count == 0)
@@ -224,6 +275,9 @@ internal class Program
 
             foreach (var document in project.Documents)
             {
+                // FIX 5: obj/bin/.git·생성 파일 제외 (분석 일관성 유지)
+                if (document.FilePath != null && IsExcludedSourcePath(document.FilePath)) continue;
+
                 var root = document.GetSyntaxRootAsync().GetAwaiter().GetResult();
                 if (root == null)
                 {
@@ -348,8 +402,15 @@ internal class Program
                 var nextMethodSyntax = innerSymbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() as MethodDeclarationSyntax;
                 if (nextMethodSyntax != null && depth < 5) // 최대 재귀 제한
                 {
-                    var nextModel = compilation?.GetSemanticModel(nextMethodSyntax.SyntaxTree) ?? semanticModel;
-                    AnalyzeInternalMethod(nextMethodSyntax, nextModel, writer, exceptionWriter, compilation, methodFullName, depth + 1, exMap);
+                    // FIX 2: 타 프로젝트/외부 정의 트리를 현재 컴파일의 GetSemanticModel 에 넘기면 ArgumentException.
+                    var declTree = nextMethodSyntax.SyntaxTree;
+                    SemanticModel? nextModel = null;
+                    if (declTree == semanticModel.SyntaxTree) nextModel = semanticModel;
+                    else if (compilation != null && compilation.ContainsSyntaxTree(declTree)) nextModel = compilation.GetSemanticModel(declTree);
+                    if (nextModel != null)
+                        AnalyzeInternalMethod(nextMethodSyntax, nextModel, writer, exceptionWriter, compilation, methodFullName, depth + 1, exMap);
+                    else
+                        ReportSkipped(writer, $"    ⤷ 재귀 분석 생략(타 프로젝트/외부 정의): {methodFullName}");
                 }
             }
         }
@@ -461,8 +522,15 @@ internal class Program
 
                 if (methodDeclSyntax != null)
                 {
-                    var methodModel = compilation?.GetSemanticModel(methodDeclSyntax.SyntaxTree) ?? semanticModel;
-                    AnalyzeInternalMethod(methodDeclSyntax, methodModel, writer, exceptionWriter, compilation, methodFullName, 1, exMap);
+                    // FIX 2: 타 프로젝트/외부 정의 트리를 현재 컴파일의 GetSemanticModel 에 넘기면 ArgumentException.
+                    var declTree = methodDeclSyntax.SyntaxTree;
+                    SemanticModel? methodModel = null;
+                    if (declTree == semanticModel.SyntaxTree) methodModel = semanticModel;
+                    else if (compilation != null && compilation.ContainsSyntaxTree(declTree)) methodModel = compilation.GetSemanticModel(declTree);
+                    if (methodModel != null)
+                        AnalyzeInternalMethod(methodDeclSyntax, methodModel, writer, exceptionWriter, compilation, methodFullName, 1, exMap);
+                    else
+                        ReportSkipped(writer, $"    ⤷ 재귀 분석 생략(타 프로젝트/외부 정의): {methodFullName}");
                 }
             }
         }
@@ -761,21 +829,22 @@ internal class Program
     }
 
     // 원본 try 를 유지하고 catch 절만 정렬된 구체 예외들로 교체한 새 TryStatement 를 생성.
-    private static TryStatementSyntax BuildReplacementTry(TryStatementSyntax original, List<string> fullTypeNames)
+    // original 은 (자식 fix 가 이미 반영된) rewritten try 일 수 있으며, 그 .Block/.Finally 를 그대로 사용해 자식 fix 를 보존한다.
+    private static TryStatementSyntax BuildReplacementTry(TryStatementSyntax original, List<string> fullTypeNames, string eol)
     {
         var sb = new StringBuilder();
         sb.Append("try ");
         sb.Append(original.Block.ToString()); // try 본문 그대로 (변경 없음)
-        sb.Append('\n');
+        sb.Append(eol);
         foreach (var t in fullTypeNames)
         {
             // 완전수식 타입 + 완전수식 Debug 호출 (using 추가 없음)
-            sb.Append($"catch ({t} ex) {{ System.Diagnostics.Debug.WriteLine(ex); /* [AUTO-CATCH] 로거로 교체 */ }}\n");
+            sb.Append($"catch ({t} ex) {{ System.Diagnostics.Debug.WriteLine(ex); /* [AUTO-CATCH] 로거로 교체 */ }}").Append(eol);
         }
         if (original.Finally != null)
         {
             sb.Append(original.Finally.ToString()); // finally 보존
-            sb.Append('\n');
+            sb.Append(eol);
         }
         return (TryStatementSyntax)SyntaxFactory.ParseStatement(sb.ToString());
     }
@@ -791,13 +860,17 @@ internal class Program
         return sb.ToString();
     }
 
-    private static void ProcessFixRoot(FixResult res, string file, SyntaxNode root, SemanticModel semanticModel, CSharpCompilation compilation, bool apply)
+    private static void ProcessFixRoot(FixResult res, string file, SyntaxNode root, SemanticModel semanticModel, CSharpCompilation compilation, bool apply, Encoding enc, string eol)
     {
         var tries = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
         if (tries.Count == 0) return;
 
-        var replacements = new Dictionary<TryStatementSyntax, TryStatementSyntax>();
-        var previewPending = new List<string>();
+        // FIX 3: 사전 빌드한 newTry 대신 (원본 try → 구체 타입/키) 매핑만 수집하고,
+        // 실제 치환은 ReplaceNodes 콜백의 rewritten 인자로 만들어 자식 fix 를 보존한다.
+        var typesFor = new Dictionary<TryStatementSyntax, List<string>>();
+        var keyFor = new Dictionary<TryStatementSyntax, string>();
+        var origFor = new Dictionary<string, (string beforeText, int line)>(); // key → (원본 미리보기, 줄)
+        int idx = 0;
 
         foreach (var tryStmt in tries)
         {
@@ -838,19 +911,26 @@ internal class Program
                 continue;
             }
 
-            var newTry = BuildReplacementTry(tryStmt, types);
-            replacements[tryStmt] = newTry;
-            previewPending.Add(BuildPreviewBlock(file, line, tryStmt.ToString(), newTry.ToString()));
+            var key = (idx++).ToString();
+            typesFor[tryStmt] = types;
+            keyFor[tryStmt] = key;
+            origFor[key] = (tryStmt.ToString(), line);
         }
 
-        if (replacements.Count == 0) return;
+        if (typesFor.Count == 0) return;
 
+        const string FixAnno = "AUTO-CATCH-FIX";
         var newRoot = root.ReplaceNodes(
-            replacements.Keys,
-            (originalNode, _) => replacements[originalNode].WithTriviaFrom(originalNode));
+            typesFor.Keys,
+            (orig, rewritten) => BuildReplacementTry((TryStatementSyntax)rewritten, typesFor[orig], eol)
+                .WithTriviaFrom(orig)
+                .WithAdditionalAnnotations(Microsoft.CodeAnalysis.Formatting.Formatter.Annotation,
+                                           new SyntaxAnnotation(FixAnno, keyFor[orig])));
 
+        // FIX 3(P2-13 format part): 주석 범위 포매팅 — 새 노드만 정렬, 나머지 파일은 바이트 보존.
         var workspace = new AdhocWorkspace();
-        var formattedRoot = Microsoft.CodeAnalysis.Formatting.Formatter.Format(newRoot, workspace);
+        var options = workspace.Options.WithChangedOption(Microsoft.CodeAnalysis.Formatting.FormattingOptions.NewLine, LanguageNames.CSharp, eol);
+        var formattedRoot = Microsoft.CodeAnalysis.Formatting.Formatter.Format(newRoot, Microsoft.CodeAnalysis.Formatting.Formatter.Annotation, workspace, options);
         var formattedText = formattedRoot.ToFullString();
 
         var origErrorIds = compilation.GetDiagnostics()
@@ -858,7 +938,7 @@ internal class Program
             .Select(d => d.Id)
             .ToHashSet();
 
-        var newTree = CSharpSyntaxTree.ParseText(formattedText, (CSharpParseOptions?)root.SyntaxTree.Options, root.SyntaxTree.FilePath, Encoding.UTF8);
+        var newTree = CSharpSyntaxTree.ParseText(formattedText, (CSharpParseOptions?)root.SyntaxTree.Options, root.SyntaxTree.FilePath, enc);
         var newComp = compilation.ReplaceSyntaxTree(root.SyntaxTree, newTree);
         var introduced = newComp.GetDiagnostics()
             .Where(d => d.Severity == DiagnosticSeverity.Error && !origErrorIds.Contains(d.Id))
@@ -871,17 +951,31 @@ internal class Program
             return;
         }
 
-        res.Modified += replacements.Count;
-        res.PreviewBlocks.AddRange(previewPending);
+        // FIX 3 step4: 치환 후 주석 노드에서 미리보기 생성 (줄 순서). 중첩 자식은 부모 노드 텍스트에 흡수됨.
+        var annotated = newRoot.GetAnnotatedNodes(FixAnno).ToList();
+        var previews = new List<(int line, string block)>();
+        foreach (var node in annotated)
+        {
+            var key = node.GetAnnotations(FixAnno).First().Data;
+            if (key != null && origFor.TryGetValue(key, out var of))
+                previews.Add((of.line, BuildPreviewBlock(file, of.line, of.beforeText, node.ToString())));
+        }
+        previews.Sort((a, b) => a.line.CompareTo(b.line));
+        res.PreviewBlocks.AddRange(previews.Select(p => p.block));
+
+        // 치환된 과도-넓음 catch 수 = 적격 try 수 (중첩 자식은 부모 재구성 시 텍스트로 흡수되어 주석이 소실될 수 있으므로
+        // 주석 노드 수가 아닌 typesFor.Count 로 집계한다 — 중첩 케이스에서 실제 치환 건수를 정확히 반영).
+        res.Modified += typesFor.Count;
 
         if (apply)
         {
-            File.WriteAllText(file, formattedText);
+            File.WriteAllText(file, formattedText, enc);
         }
     }
 
     private static FixResult RunFixSolution(string solutionPath, bool apply)
     {
+        EnsureCodePagesRegistered();
         var res = new FixResult();
         using var workspace = OpenSolutionWorkspace(solutionPath, out var resolvedSolutionPath);
         var solution = workspace.OpenSolutionAsync(resolvedSolutionPath).GetAwaiter().GetResult();
@@ -905,6 +999,9 @@ internal class Program
                     continue;
                 }
 
+                // FIX 5: obj/bin/.git·생성 파일 제외
+                if (IsExcludedSourcePath(file)) continue;
+
                 var root = document.GetSyntaxRootAsync().GetAwaiter().GetResult();
                 if (root == null)
                 {
@@ -912,35 +1009,45 @@ internal class Program
                     continue;
                 }
 
+                // FIX 4: 워크스페이스 root 를 구문 소스로 쓰되, 파일 바이트에서 (인코딩, EOL) 만 감지해 보존 되쓰기.
+                var (_, enc, eol) = ReadSourcePreserving(file);
                 var semanticModel = compilation.GetSemanticModel(root.SyntaxTree);
-                ProcessFixRoot(res, file, root, semanticModel, compilation, apply);
+                ProcessFixRoot(res, file, root, semanticModel, compilation, apply, enc, eol);
             }
         }
 
         return res;
     }
 
-    public static FixResult RunFix(string targetDirectory, bool apply)
+    public static FixResult RunFix(string target, bool apply, bool allowSourceOnlyFallback = false)
     {
         if (_apiDocCache.Count == 0)
         {
             LoadXmlDocumentation();
         }
 
-        var solutionPath = TryResolveSingleSolutionPath(targetDirectory);
-        if (solutionPath != null)
+        var solutionPath = TryResolveSingleSolutionPath(target);
+        if (solutionPath != null) return RunFixSolution(solutionPath, apply);
+        if (!allowSourceOnlyFallback)
         {
-            return RunFixSolution(solutionPath, apply);
+            // 분석 경로(ResolveSolutionPath)와 동일하게 명시적으로 실패시킨다 — 조용한 폴더 확대 금지.
+            // ResolveSolutionPath(target) 를 호출하면 0개/복수 .sln 에 맞는 한국어 예외 메시지가 던져진다.
+            ResolveSolutionPath(target); // always throws here (sln==1 case was handled above)
+            throw new InvalidOperationException($"솔루션을 확정할 수 없습니다: {target}"); // unreachable safety
         }
 
+        // (이하 기존 폴더 모드 유지 — FIX 4 인코딩 보존 + FIX 5 제외 필터 적용)
+        EnsureCodePagesRegistered();
         var res = new FixResult();
 
-        var references = BuildReferences(targetDirectory);
-        var csFiles = Directory.GetFiles(targetDirectory, "*.cs", SearchOption.AllDirectories);
+        var references = BuildReferences(target);
+        var csFiles = Directory.GetFiles(target, "*.cs", SearchOption.AllDirectories);
 
         foreach (var file in csFiles)
         {
-            var code = File.ReadAllText(file);
+            if (IsExcludedSourcePath(file)) continue;
+
+            var (code, enc, eol) = ReadSourcePreserving(file);
             var tree = CSharpSyntaxTree.ParseText(code);
             var root = tree.GetRoot();
 
@@ -949,7 +1056,7 @@ internal class Program
                 .AddSyntaxTrees(tree);
             var semanticModel = compilation.GetSemanticModel(tree);
 
-            ProcessFixRoot(res, file, root, semanticModel, compilation, apply);
+            ProcessFixRoot(res, file, root, semanticModel, compilation, apply, enc, eol);
         }
 
         return res;
@@ -1039,12 +1146,12 @@ internal class Program
             var before = files.ToDictionary(f => f, f => File.ReadAllText(f));
 
             // 2. preview → 디스크 변경 없어야 함
-            var previewRes = RunFix(fixtureDir, false);
+            var previewRes = RunFix(fixtureDir, false, allowSourceOnlyFallback: true);
             bool previewUnchanged = files.All(f => File.ReadAllText(f) == before[f]);
             L($"[preview] 디스크 미변경: {(previewUnchanged ? "PASS" : "FAIL")} (Modified 미리보기={previewRes.Modified})");
 
             // 3. apply
-            var res = RunFix(fixtureDir, true);
+            var res = RunFix(fixtureDir, true, allowSourceOnlyFallback: true);
 
             var broadText = File.ReadAllText(broadPath);
             var emptyText = File.ReadAllText(emptyPath);
@@ -1100,7 +1207,141 @@ internal class Program
             L($"[5] Broad 에 using System.Diagnostics; 미추가: {(t5 ? "PASS" : "FAIL")}");
             L($"[6] Empty 변경 → 구체 catch + Debug.WriteLine: {(t6 ? "PASS" : "FAIL")}");
 
-            allPass = previewUnchanged && t1 && t2 && t3 && t4 && t5 && t6;
+            // ── [7] nested-try : 부모/자식 broad 모두 치환, Modified==2, 재컴파일 CS0160 없음 ──
+            var nestedDir = Path.Combine(fixtureDir, "nested");
+            Directory.CreateDirectory(nestedDir);
+            var nestedPath = Path.Combine(nestedDir, "Nested.cs");
+            File.WriteAllText(nestedPath,
+                "using System;\n" +
+                "class N {\n" +
+                "    void M(string s) {\n" +
+                "        try {\n" +
+                "            try { int a = int.Parse(s); } catch (Exception ex) { Log(ex); }\n" +
+                "            int b = int.Parse(s);\n" +
+                "        } catch (Exception ex) { Log(ex); }\n" +
+                "    }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var nestedRes = RunFix(nestedDir, true, allowSourceOnlyFallback: true);
+            var nestedText = File.ReadAllText(nestedPath);
+            int autoCatchCount = System.Text.RegularExpressions.Regex.Matches(nestedText, @"\[AUTO-CATCH\]").Count;
+            bool nestedNoBroad = !nestedText.Contains("catch (Exception ");
+            var nestedTree = CSharpSyntaxTree.ParseText(nestedText);
+            var nestedComp = CSharpCompilation.Create("NestedCheck").AddReferences(BuildReferences(nestedDir)).AddSyntaxTrees(nestedTree);
+            bool nestedNoCs0160 = !nestedComp.GetDiagnostics().Any(d => d.Id == "CS0160");
+            bool t7 = nestedNoBroad && autoCatchCount >= 2 && nestedRes.Modified == 2 && nestedNoCs0160;
+            L($"[7] nested-try: {(t7 ? "PASS" : "FAIL")} (Modified={nestedRes.Modified}, autoCatch={autoCatchCount}, noBroad={nestedNoBroad}, noCS0160={nestedNoCs0160})");
+
+            // ── [8] cross-project guard (in-memory, no MSBuild) : 외부 트리 심볼로 AnalyzeTryBlock 이 예외 없이 통과 ──
+            var xNet472 = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\";
+            var xRefs = new[] { "mscorlib.dll", "System.dll", "System.Core.dll" }
+                .Select(n => (MetadataReference)MetadataReference.CreateFromFile(Path.Combine(xNet472, n)))
+                .ToList();
+            var srcB = "namespace ExtLib { public class Lib { public static void M(string s) { int.Parse(s); } } }";
+            var treeB = CSharpSyntaxTree.ParseText(srcB);
+            var compB = CSharpCompilation.Create("compB")
+                .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+                .AddReferences(xRefs)
+                .AddSyntaxTrees(treeB);
+            var srcA = "using System;\nclass A { void F(string s) { try { ExtLib.Lib.M(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }";
+            var treeA = CSharpSyntaxTree.ParseText(srcA);
+            var refsA = new List<MetadataReference>(xRefs) { compB.ToMetadataReference() };
+            var compA = CSharpCompilation.Create("compA")
+                .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+                .AddReferences(refsA)
+                .AddSyntaxTrees(treeA);
+            var modelA = compA.GetSemanticModel(treeA);
+            var tryStmtA = treeA.GetRoot().DescendantNodes().OfType<TryStatementSyntax>().First();
+            bool t8;
+            try { AnalyzeTryBlock(tryStmtA, modelA, compilation: compA); t8 = true; }
+            catch (Exception ex) { t8 = false; L("  [8] 예외 발생: " + ex.GetType().Name + " — " + ex.Message); }
+            L($"[8] cross-project guard (예외 없음): {(t8 ? "PASS" : "FAIL")}");
+
+            // ── [9] encoding preservation : BOM+CRLF / no-BOM / CP949 보존 ──
+            EnsureCodePagesRegistered();
+            var encDir = Path.Combine(fixtureDir, "enc");
+            Directory.CreateDirectory(encDir);
+            string EligibleSrc(string cls, string extraComment) =>
+                "using System;\n" + extraComment +
+                "class " + cls + " { void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }\n";
+
+            var bomPath = Path.Combine(encDir, "EncBomCrlf.cs");
+            var bomText = EligibleSrc("C_a", "").Replace("\n", "\r\n");
+            File.WriteAllText(bomPath, bomText, new UTF8Encoding(true));
+
+            var noBomPath = Path.Combine(encDir, "EncNoBom.cs");
+            File.WriteAllText(noBomPath, EligibleSrc("C_b", ""), new UTF8Encoding(false));
+
+            var cp949Path = Path.Combine(encDir, "EncCp949.cs");
+            var cp949 = Encoding.GetEncoding(949);
+            File.WriteAllText(cp949Path, EligibleSrc("C_c", "// 한글주석확인\n"), cp949);
+
+            var encRes = RunFix(encDir, true, allowSourceOnlyFallback: true);
+
+            var bomBytes = File.ReadAllBytes(bomPath);
+            bool bomKept = bomBytes.Length >= 3 && bomBytes[0] == 0xEF && bomBytes[1] == 0xBB && bomBytes[2] == 0xBF;
+            bool crlfKept = true;
+            for (int i = 0; i < bomBytes.Length; i++)
+                if (bomBytes[i] == 0x0A && (i == 0 || bomBytes[i - 1] != 0x0D)) { crlfKept = false; break; }
+            bool aOk = bomKept && crlfKept;
+
+            var noBomBytes = File.ReadAllBytes(noBomPath);
+            bool bOk = !(noBomBytes.Length >= 3 && noBomBytes[0] == 0xEF && noBomBytes[1] == 0xBB && noBomBytes[2] == 0xBF);
+
+            var cp949After = cp949.GetString(File.ReadAllBytes(cp949Path));
+            bool cOk = cp949After.Contains("한글주석확인");
+
+            bool t9 = aOk && bOk && cOk && encRes.Modified >= 3;
+            L($"[9] encoding preservation: {(t9 ? "PASS" : "FAIL")} (BOM/CRLF={aOk}, noBOM={bOk}, cp949={cOk}, Modified={encRes.Modified})");
+
+            // ── [10] format scope : 무관한 이상포맷 라인 보존 ──
+            var fmtDir = Path.Combine(fixtureDir, "format");
+            Directory.CreateDirectory(fmtDir);
+            var fmtPath = Path.Combine(fmtDir, "Fmt.cs");
+            File.WriteAllText(fmtPath,
+                "using System;\n" +
+                "class C_fmt {\n" +
+                "    void A(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } }\n" +
+                "    void B() { int    weird=1 ; }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var fmtRes = RunFix(fmtDir, true, allowSourceOnlyFallback: true);
+            var fmtText = File.ReadAllText(fmtPath);
+            bool weirdKept = fmtText.Contains("int    weird=1 ;");
+            bool t10 = weirdKept && fmtRes.Modified == 1;
+            L($"[10] format scope: {(t10 ? "PASS" : "FAIL")} (weird 보존={weirdKept}, Modified={fmtRes.Modified})");
+
+            // ── [11] no silent fallback : sln 없는 폴더 → allow:false 는 예외, allow:true 는 성공 ──
+            var fbDir = Path.Combine(fixtureDir, "fallback");
+            Directory.CreateDirectory(fbDir);
+            File.WriteAllText(Path.Combine(fbDir, "Fb.cs"),
+                "using System;\nclass Fb { void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }\n");
+            bool t11a;
+            try { RunFix(fbDir, false, allowSourceOnlyFallback: false); t11a = false; L("  [11] 예외 미발생(예상: InvalidOperationException)"); }
+            catch (InvalidOperationException) { t11a = true; }
+            catch (Exception ex) { t11a = false; L("  [11] 잘못된 예외: " + ex.GetType().Name); }
+            bool t11b;
+            try { RunFix(fbDir, false, allowSourceOnlyFallback: true); t11b = true; }
+            catch (Exception ex) { t11b = false; L("  [11] allow:true 인데 예외: " + ex.GetType().Name); }
+            bool t11 = t11a && t11b;
+            L($"[11] no silent fallback: {(t11 ? "PASS" : "FAIL")} (throw={t11a}, allowOk={t11b})");
+
+            // ── [12] excluded paths : obj\Gen.g.cs 는 수정 대상에서 제외 (바이트 불변) ──
+            var exDir = Path.Combine(fixtureDir, "excluded");
+            var objDir = Path.Combine(exDir, "obj");
+            Directory.CreateDirectory(objDir);
+            var genPath = Path.Combine(objDir, "Gen.g.cs");
+            File.WriteAllText(genPath,
+                "using System;\nclass Gen { void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }\n");
+            var genBefore = File.ReadAllBytes(genPath);
+            var exRes = RunFix(exDir, true, allowSourceOnlyFallback: true);
+            var genAfter = File.ReadAllBytes(genPath);
+            bool bytesEqual = genBefore.SequenceEqual(genAfter);
+            bool t12 = bytesEqual && exRes.Modified == 0;
+            L($"[12] excluded paths (obj\\Gen.g.cs 미변경): {(t12 ? "PASS" : "FAIL")} (bytesEqual={bytesEqual}, Modified={exRes.Modified})");
+
+            allPass = previewUnchanged && t1 && t2 && t3 && t4 && t5 && t6
+                   && t7 && t8 && t9 && t10 && t11 && t12;
             L(allPass ? "SELFTEST-FIX PASS" : "SELFTEST-FIX FAIL");
         }
         catch (Exception ex)
