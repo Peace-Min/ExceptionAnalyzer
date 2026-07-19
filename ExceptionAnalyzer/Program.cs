@@ -1,6 +1,8 @@
 ﻿using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.MSBuild;
+using Microsoft.Build.Locator;
 using System.Xml.Linq;
 using System;
 using System.IO;
@@ -23,9 +25,123 @@ internal class Program
     private static Dictionary<string, string> methodExceptionList = new Dictionary<string, string>();
     private static readonly string NET_FRAMEWORK_PATH = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\ko";
     private static Dictionary<string, ApiDocumentation> _apiDocCache = new Dictionary<string, ApiDocumentation>();
+    private static bool _msBuildRegistered;
 
     // 분석 로그 싱크: 콘솔(헤드리스) 또는 WPF 창으로 라우팅
     public static Action<string> Log = Console.WriteLine;
+
+    private static void EnsureMSBuildRegistered()
+    {
+        if (_msBuildRegistered || MSBuildLocator.IsRegistered)
+        {
+            _msBuildRegistered = true;
+            return;
+        }
+
+        try
+        {
+            MSBuildLocator.RegisterDefaults();
+        }
+        catch (InvalidOperationException)
+        {
+            var sdkPath = FindDotNetSdkMsBuildPath();
+            if (sdkPath == null)
+            {
+                throw;
+            }
+
+            MSBuildLocator.RegisterMSBuildPath(sdkPath);
+        }
+
+        _msBuildRegistered = true;
+    }
+
+    private static string? FindDotNetSdkMsBuildPath()
+    {
+        var roots = new[]
+        {
+            Environment.GetEnvironmentVariable("DOTNET_ROOT"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "dotnet"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "dotnet")
+        };
+
+        foreach (var root in roots.Where(r => !string.IsNullOrWhiteSpace(r)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var sdkRoot = Path.Combine(root!, "sdk");
+            if (!Directory.Exists(sdkRoot))
+            {
+                continue;
+            }
+
+            var sdkPath = Directory.GetDirectories(sdkRoot)
+                .Select(d => new { Path = d, Version = ParseSdkVersion(Path.GetFileName(d)) })
+                .Where(x => x.Version != null
+                    && x.Version.Major <= Environment.Version.Major
+                    && File.Exists(Path.Combine(x.Path, "MSBuild.dll")))
+                .OrderByDescending(x => x.Version)
+                .Select(x => x.Path)
+                .FirstOrDefault();
+
+            if (sdkPath != null)
+            {
+                return sdkPath;
+            }
+        }
+
+        return null;
+    }
+
+    private static Version? ParseSdkVersion(string name)
+    {
+        var numeric = new string(name.TakeWhile(c => char.IsDigit(c) || c == '.').ToArray()).TrimEnd('.');
+        return Version.TryParse(numeric, out var version) ? version : null;
+    }
+
+    // A directory is a solution root only when it contains exactly one solution.
+    // Requiring an explicit .sln for ambiguous roots prevents silently analyzing
+    // a different project than the user selected.
+    private static string ResolveSolutionPath(string target)
+    {
+        if (File.Exists(target) && string.Equals(Path.GetExtension(target), ".sln", StringComparison.OrdinalIgnoreCase))
+            return Path.GetFullPath(target);
+
+        if (!Directory.Exists(target))
+            throw new DirectoryNotFoundException($"분석 대상이 존재하지 않습니다: {target}");
+
+        var solutions = Directory.GetFiles(target, "*.sln", SearchOption.TopDirectoryOnly);
+        if (solutions.Length == 1) return Path.GetFullPath(solutions[0]);
+        if (solutions.Length == 0)
+            throw new InvalidOperationException($"선택한 폴더에 .sln 파일이 없습니다: {target}");
+        throw new InvalidOperationException($"선택한 폴더에 .sln 파일이 여러 개입니다. 분석할 .sln을 직접 선택하세요: {target}");
+    }
+
+    private static string? TryResolveSingleSolutionPath(string target)
+    {
+        if (File.Exists(target) && string.Equals(Path.GetExtension(target), ".sln", StringComparison.OrdinalIgnoreCase))
+            return Path.GetFullPath(target);
+
+        if (!Directory.Exists(target))
+            return null;
+
+        var solutions = Directory.GetFiles(target, "*.sln", SearchOption.TopDirectoryOnly);
+        return solutions.Length == 1 ? Path.GetFullPath(solutions[0]) : null;
+    }
+
+    private static MSBuildWorkspace OpenSolutionWorkspace(string target, out string solutionPath)
+    {
+        EnsureMSBuildRegistered();
+        solutionPath = ResolveSolutionPath(target);
+        var workspace = MSBuildWorkspace.Create();
+        workspace.WorkspaceFailed += (_, e) => Log($"⚠️ MSBuildWorkspace: {e.Diagnostic.Message}");
+        return workspace;
+    }
+
+    private static void ReportSkipped(StreamWriter? writer, string message)
+    {
+        var text = "⚠️ 건너뜀: " + message;
+        if (writer != null) writer.WriteLine(text);
+        Log(text);
+    }
 
     private static void LoadXmlDocumentation()
     {
@@ -83,7 +199,9 @@ internal class Program
             Log($"✅ {_apiDocCache.Count}개의 API 문서 로드 완료");
         }
 
-        var lastFolderName = new DirectoryInfo(targetDirectory).Name;
+        using var workspace = OpenSolutionWorkspace(targetDirectory, out var solutionPath);
+        var solution = workspace.OpenSolutionAsync(solutionPath).GetAwaiter().GetResult();
+        var lastFolderName = Path.GetFileNameWithoutExtension(solutionPath);
 
         // 2. 출력 파일 경로 지정
         var outputPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"{lastFolderName}_ApiCallCandidates.txt");
@@ -93,59 +211,47 @@ internal class Program
         using var writer = new StreamWriter(outputPath);
         using var exceptionWriter = new StreamWriter(unregisteredExceptionMapPath);
 
-        Log($"🔍 디렉토리 분석 시작: {targetDirectory}");
+        Log($"🔍 솔루션 분석 시작: {solutionPath}");
 
-        // 4. 디렉토리 내 모든 .cs 파일 재귀적으로 수집
-        var csFiles = Directory.GetFiles(targetDirectory, "*.cs", SearchOption.AllDirectories);
-
-        // 5. 각 파일에 대해 반복 수행
-        foreach (var file in csFiles)
+        foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
         {
-            // 5-1. 파일 내용을 문자열로 읽어옴 (백그라운드 스레드에서 동기 실행)
-            var code = File.ReadAllText(file);
-
-            // 5-2. Roslyn으로 C# 구문 트리(SyntaxTree) 생성
-            var tree = CSharpSyntaxTree.ParseText(code);
-
-            // 5-3. 구문 트리에서 루트 노드 추출 (SyntaxNode)
-            var root = tree.GetRoot();
-
-            // 5-4. 모든 try 블록을 AST에서 수집
-            var tryStatements = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
-
-            if (!tryStatements.Any()) continue;
-
-            // 6. 대상 프로젝트 분석에 필요한 메타데이터 설정 (bin\Debug + net472 기본 어셈블리)
-            var references = BuildReferences(targetDirectory);
-
-            // 7. Roslyn 컴파일러 객체 생성 (코드 분석에 필요)
-            var compilation = CSharpCompilation.Create("Analysis")
-                .AddReferences(references)
-                .AddSyntaxTrees(tree);// 현재 분석 중인 소스 트리 추가
-
-            // 8. 현재 구문 트리에 대한 의미 정보 모델(SemanticModel) 생성
-            var semanticModel = compilation.GetSemanticModel(tree);
-
-            // 9. 각 try 블록 내부를 분석
-            foreach (var tryStmt in tryStatements)
+            var compilation = project.GetCompilationAsync().GetAwaiter().GetResult() as CSharpCompilation;
+            if (compilation == null)
             {
-                // 9-1. 해당 try 블록의 위치 출력
-                var lineSpan = tryStmt.GetLocation().GetLineSpan();
-                var line = lineSpan.StartLinePosition.Line + 1;
+                ReportSkipped(writer, $"프로젝트 컴파일을 만들 수 없음: {project.Name}");
+                continue;
+            }
 
-                // 9-2. try 블록 내부의 모든 메서드 호출 구문 수집
-                var methodCalls = tryStmt.Block.DescendantNodes().OfType<InvocationExpressionSyntax>();
+            foreach (var document in project.Documents)
+            {
+                var root = document.GetSyntaxRootAsync().GetAwaiter().GetResult();
+                if (root == null)
+                {
+                    ReportSkipped(writer, $"문서 구문 트리를 읽을 수 없음: {document.FilePath ?? document.Name}");
+                    continue;
+                }
 
-                if (!methodCalls.Any()) continue; // 🔥 메서드 호출 없으면 출력 생략
+                var tryStatements = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
+                if (!tryStatements.Any()) continue;
 
-                var message = $"📄 파일: {file}, 줄: {line} → try 블록 내부 API 호출:";
-                Log(message);
-                writer.WriteLine(message);
+                var semanticModel = compilation.GetSemanticModel(root.SyntaxTree);
+                var file = document.FilePath ?? document.Name;
+                foreach (var tryStmt in tryStatements)
+                {
+                    var line = tryStmt.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
+                    var methodCalls = tryStmt.Block.DescendantNodes().OfType<InvocationExpressionSyntax>();
+                    if (!methodCalls.Any())
+                    {
+                        ReportSkipped(writer, $"{file}:{line} — try 블록에 호출식이 없음");
+                        continue;
+                    }
 
-                // 9-3. try 블록 내부 예외 집계 (추출된 재사용 코어). 파일 writer/exceptionWriter를 넘겨 --analyze 출력 보존.
-                methodExceptionList = AnalyzeTryBlock(tryStmt, semanticModel, writer, exceptionWriter);
-
-                EmitOrderedCatches(writer, compilation, methodExceptionList);
+                    var message = $"📄 파일: {file}, 줄: {line} → try 블록 내부 API 호출:";
+                    Log(message);
+                    writer.WriteLine(message);
+                    methodExceptionList = AnalyzeTryBlock(tryStmt, semanticModel, writer, exceptionWriter, compilation);
+                    EmitOrderedCatches(writer, compilation, methodExceptionList);
+                }
             }
         }
 
@@ -156,7 +262,7 @@ internal class Program
     }
 
     // exMap 에 집계, writer/exceptionWriter 는 nullable — null 이면 파일/로그 출력 없이 순수 집계만 수행(RunFix 재사용).
-    private static void AnalyzeInternalMethod(MethodDeclarationSyntax methodSyntax, SemanticModel semanticModel, StreamWriter? writer, StreamWriter? exceptionWriter, string callerFullName, int depth, Dictionary<string, string> exMap)
+    private static void AnalyzeInternalMethod(MethodDeclarationSyntax methodSyntax, SemanticModel semanticModel, StreamWriter? writer, StreamWriter? exceptionWriter, CSharpCompilation? compilation, string callerFullName, int depth, Dictionary<string, string> exMap)
     {
         var indent = new string(' ', depth * 4); // 재귀 깊이에 따라 들여쓰기
 
@@ -242,7 +348,8 @@ internal class Program
                 var nextMethodSyntax = innerSymbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() as MethodDeclarationSyntax;
                 if (nextMethodSyntax != null && depth < 5) // 최대 재귀 제한
                 {
-                    AnalyzeInternalMethod(nextMethodSyntax, semanticModel, writer, exceptionWriter, methodFullName, depth + 1, exMap);
+                    var nextModel = compilation?.GetSemanticModel(nextMethodSyntax.SyntaxTree) ?? semanticModel;
+                    AnalyzeInternalMethod(nextMethodSyntax, nextModel, writer, exceptionWriter, compilation, methodFullName, depth + 1, exMap);
                 }
             }
         }
@@ -283,7 +390,7 @@ internal class Program
     }
 
     // ── 추출된 재사용 코어 ② : try 블록 내부 예외 집계 (type→한글설명 맵). writer 가 null 이면 순수 집계(무출력).
-    public static Dictionary<string, string> AnalyzeTryBlock(TryStatementSyntax tryStmt, SemanticModel semanticModel, StreamWriter? writer = null, StreamWriter? exceptionWriter = null)
+    public static Dictionary<string, string> AnalyzeTryBlock(TryStatementSyntax tryStmt, SemanticModel semanticModel, StreamWriter? writer = null, StreamWriter? exceptionWriter = null, CSharpCompilation? compilation = null)
     {
         var exMap = new Dictionary<string, string>();
 
@@ -354,7 +461,8 @@ internal class Program
 
                 if (methodDeclSyntax != null)
                 {
-                    AnalyzeInternalMethod(methodDeclSyntax, semanticModel, writer, exceptionWriter, methodFullName, 1, exMap);
+                    var methodModel = compilation?.GetSemanticModel(methodDeclSyntax.SyntaxTree) ?? semanticModel;
+                    AnalyzeInternalMethod(methodDeclSyntax, methodModel, writer, exceptionWriter, compilation, methodFullName, 1, exMap);
                 }
             }
         }
@@ -683,14 +791,149 @@ internal class Program
         return sb.ToString();
     }
 
-    public static FixResult RunFix(string targetDirectory, bool apply)
+    private static void ProcessFixRoot(FixResult res, string file, SyntaxNode root, SemanticModel semanticModel, CSharpCompilation compilation, bool apply)
+    {
+        var tries = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
+        if (tries.Count == 0) return;
+
+        var replacements = new Dictionary<TryStatementSyntax, TryStatementSyntax>();
+        var previewPending = new List<string>();
+
+        foreach (var tryStmt in tries)
+        {
+            var catches = tryStmt.Catches;
+            var line = tryStmt.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
+
+            // 단일 catch 만 대상 (finally 는 허용). 0개/다중 catch → not-broad.
+            if (catches.Count != 1)
+            {
+                res.Skipped_NotBroad++;
+                res.ManualReview.Add($"{file}:{line} (건너뜀: catch가 1개가 아님)");
+                continue;
+            }
+
+            var theCatch = catches[0];
+            if (!IsOverBroadCatch(theCatch, semanticModel))
+            {
+                res.Skipped_NotBroad++;
+                continue;
+            }
+
+            // 과도하게 넓지만 본문이 치환-불안전 → 수동 검토
+            if (!IsReplaceSafeBody(theCatch))
+            {
+                res.ManualReview.Add($"{file}:{line}");
+                res.Skipped_NonTrivial++;
+                continue;
+            }
+
+            // 적격 대상: 구체 예외 추론
+            var exMap = AnalyzeTryBlock(tryStmt, semanticModel, compilation: compilation);
+            var types = GetOrderedResolvedCatchTypes(compilation, exMap);
+            if (types.Count == 0)
+            {
+                // catch-less try 를 절대 만들지 않음
+                res.Skipped_Empty++;
+                res.ManualReview.Add($"{file}:{line} (건너뜀: 추론된 구체 예외 없음)");
+                continue;
+            }
+
+            var newTry = BuildReplacementTry(tryStmt, types);
+            replacements[tryStmt] = newTry;
+            previewPending.Add(BuildPreviewBlock(file, line, tryStmt.ToString(), newTry.ToString()));
+        }
+
+        if (replacements.Count == 0) return;
+
+        var newRoot = root.ReplaceNodes(
+            replacements.Keys,
+            (originalNode, _) => replacements[originalNode].WithTriviaFrom(originalNode));
+
+        var workspace = new AdhocWorkspace();
+        var formattedRoot = Microsoft.CodeAnalysis.Formatting.Formatter.Format(newRoot, workspace);
+        var formattedText = formattedRoot.ToFullString();
+
+        var origErrorIds = compilation.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error)
+            .Select(d => d.Id)
+            .ToHashSet();
+
+        var newTree = CSharpSyntaxTree.ParseText(formattedText, (CSharpParseOptions?)root.SyntaxTree.Options, root.SyntaxTree.FilePath, Encoding.UTF8);
+        var newComp = compilation.ReplaceSyntaxTree(root.SyntaxTree, newTree);
+        var introduced = newComp.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error && !origErrorIds.Contains(d.Id))
+            .ToList();
+
+        if (introduced.Count > 0)
+        {
+            res.CompileReverted++;
+            res.ManualReview.Add($"{file} (컴파일 롤백: {string.Join(",", introduced.Select(d => d.Id).Distinct())})");
+            return;
+        }
+
+        res.Modified += replacements.Count;
+        res.PreviewBlocks.AddRange(previewPending);
+
+        if (apply)
+        {
+            File.WriteAllText(file, formattedText);
+        }
+    }
+
+    private static FixResult RunFixSolution(string solutionPath, bool apply)
     {
         var res = new FixResult();
+        using var workspace = OpenSolutionWorkspace(solutionPath, out var resolvedSolutionPath);
+        var solution = workspace.OpenSolutionAsync(resolvedSolutionPath).GetAwaiter().GetResult();
 
+        Log($"🔧 솔루션 수정 시작: {resolvedSolutionPath}");
+
+        foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        {
+            var compilation = project.GetCompilationAsync().GetAwaiter().GetResult() as CSharpCompilation;
+            if (compilation == null)
+            {
+                res.ManualReview.Add($"{project.Name} (건너뜀: 프로젝트 컴파일 생성 실패)");
+                continue;
+            }
+
+            foreach (var document in project.Documents)
+            {
+                var file = document.FilePath;
+                if (string.IsNullOrWhiteSpace(file) || !File.Exists(file))
+                {
+                    continue;
+                }
+
+                var root = document.GetSyntaxRootAsync().GetAwaiter().GetResult();
+                if (root == null)
+                {
+                    res.ManualReview.Add($"{document.Name} (건너뜀: 구문 트리 없음)");
+                    continue;
+                }
+
+                var semanticModel = compilation.GetSemanticModel(root.SyntaxTree);
+                ProcessFixRoot(res, file, root, semanticModel, compilation, apply);
+            }
+        }
+
+        return res;
+    }
+
+    public static FixResult RunFix(string targetDirectory, bool apply)
+    {
         if (_apiDocCache.Count == 0)
         {
             LoadXmlDocumentation();
         }
+
+        var solutionPath = TryResolveSingleSolutionPath(targetDirectory);
+        if (solutionPath != null)
+        {
+            return RunFixSolution(solutionPath, apply);
+        }
+
+        var res = new FixResult();
 
         var references = BuildReferences(targetDirectory);
         var csFiles = Directory.GetFiles(targetDirectory, "*.cs", SearchOption.AllDirectories);
@@ -706,96 +949,7 @@ internal class Program
                 .AddSyntaxTrees(tree);
             var semanticModel = compilation.GetSemanticModel(tree);
 
-            var tries = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
-            if (tries.Count == 0) continue;
-
-            var replacements = new Dictionary<TryStatementSyntax, TryStatementSyntax>();
-            var previewPending = new List<string>();
-
-            foreach (var tryStmt in tries)
-            {
-                var catches = tryStmt.Catches;
-
-                // 단일 catch 만 대상 (finally 는 허용). 0개/다중 catch → not-broad.
-                if (catches.Count != 1)
-                {
-                    res.Skipped_NotBroad++;
-                    continue;
-                }
-
-                var theCatch = catches[0];
-                if (!IsOverBroadCatch(theCatch, semanticModel))
-                {
-                    res.Skipped_NotBroad++;
-                    continue;
-                }
-
-                // 과도하게 넓지만 본문이 치환-불안전 → 수동 검토
-                if (!IsReplaceSafeBody(theCatch))
-                {
-                    var ln = tryStmt.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
-                    res.ManualReview.Add($"{file}:{ln}");
-                    res.Skipped_NonTrivial++;
-                    continue;
-                }
-
-                // 적격 대상: 구체 예외 추론
-                var exMap = AnalyzeTryBlock(tryStmt, semanticModel);
-                var types = GetOrderedResolvedCatchTypes(compilation, exMap);
-                if (types.Count == 0)
-                {
-                    // catch-less try 를 절대 만들지 않음
-                    res.Skipped_Empty++;
-                    continue;
-                }
-
-                var newTry = BuildReplacementTry(tryStmt, types);
-                replacements[tryStmt] = newTry;
-
-                var line = tryStmt.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
-                previewPending.Add(BuildPreviewBlock(file, line, tryStmt.ToString(), newTry.ToString()));
-            }
-
-            if (replacements.Count == 0) continue;
-
-            var newRoot = root.ReplaceNodes(
-                replacements.Keys,
-                (originalNode, _) => replacements[originalNode].WithTriviaFrom(originalNode));
-
-            // 들여쓰기 정리
-            var workspace = new AdhocWorkspace();
-            var formattedRoot = Microsoft.CodeAnalysis.Formatting.Formatter.Format(newRoot, workspace);
-            var formattedText = formattedRoot.ToFullString();
-
-            // 파일별 자가검증: 새 트리가 원본에 없던 새 오류를 유발하면 통째로 폐기
-            var origErrorIds = compilation.GetDiagnostics()
-                .Where(d => d.Severity == DiagnosticSeverity.Error)
-                .Select(d => d.Id)
-                .ToHashSet();
-
-            var newTree = CSharpSyntaxTree.ParseText(formattedText);
-            var newComp = CSharpCompilation.Create("FixValidate")
-                .AddReferences(references)
-                .AddSyntaxTrees(newTree);
-            var introduced = newComp.GetDiagnostics()
-                .Where(d => d.Severity == DiagnosticSeverity.Error && !origErrorIds.Contains(d.Id))
-                .ToList();
-
-            if (introduced.Count > 0)
-            {
-                res.CompileReverted++;
-                res.ManualReview.Add($"{file} (컴파일 롤백: {string.Join(",", introduced.Select(d => d.Id).Distinct())})");
-                continue; // 이 파일 변경 폐기
-            }
-
-            // 검증 통과
-            res.Modified += replacements.Count;
-            res.PreviewBlocks.AddRange(previewPending);
-
-            if (apply)
-            {
-                File.WriteAllText(file, formattedText);
-            }
+            ProcessFixRoot(res, file, root, semanticModel, compilation, apply);
         }
 
         return res;
