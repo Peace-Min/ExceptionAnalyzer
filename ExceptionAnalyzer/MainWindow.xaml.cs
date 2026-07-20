@@ -32,17 +32,10 @@ namespace ExceptionAnalyzer
                 return;
             }
 
-            var confirm = System.Windows.MessageBox.Show(
-                $"대상: {target}\n\n과도한 catch(Exception)를 추론된 구체 예외 catch로 소스 파일에서 직접 수정합니다.\n\n되돌리려면 git 같은 버전 관리가 필요합니다. 백업을 권장합니다.\n\n계속할까요?",
-                "소스 자동수정 적용", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-            if (confirm != MessageBoxResult.Yes)
-            {
-                StatusText.Text = "상태: 취소됨";
-                return;
-            }
-
-            LogBox.Clear();
-            StatusText.Text = "상태: 분석 + 소스 수정 중...";
+            // 재진입 방지: 실행 중에는 분석/폴더선택 버튼을 비활성화(더블클릭 이중 적용 방지)
+            AnalyzeButton.IsEnabled = false;
+            PickFolderButton.IsEnabled = false;
+            // 분석 로그를 로그창으로 라우팅 (finally 에서 콘솔로 복원)
             global::Program.Log = msg => Dispatcher.BeginInvoke(new Action(() =>
             {
                 LogBox.AppendText(msg + Environment.NewLine);
@@ -51,32 +44,83 @@ namespace ExceptionAnalyzer
 
             try
             {
-                var res = await Task.Run(() =>
+                // 1) 미리보기 분석 (파일 미변경)
+                LogBox.Clear();
+                StatusText.Text = "상태: 미리보기 분석 중...";
+                global::Program.FixResult preview;
+                try
                 {
-                    var r = global::Program.RunFix(target, apply: true);
-                    global::Program.WriteFixReport(r, true);
-                    return r;
-                });
+                    preview = await Task.Run(() => global::Program.RunFix(target, apply: false));
+                }
+                catch (Exception ex)
+                {
+                    StatusText.Text = "상태: 오류 - " + ex.Message;
+                    return;
+                }
 
-                _lastOutputDir = AppDomain.CurrentDomain.BaseDirectory;
-
-                LogBox.AppendText(Environment.NewLine + "===== 소스 자동수정 결과 =====" + Environment.NewLine);
-                foreach (var b in res.PreviewBlocks) LogBox.AppendText(b + Environment.NewLine);
-                if (res.ManualReview.Count > 0)
+                // 2) 미리보기 결과를 로그창에 표시
+                LogBox.AppendText(Environment.NewLine + "===== 미리보기 (아직 파일 미변경) =====" + Environment.NewLine);
+                foreach (var b in preview.PreviewBlocks) LogBox.AppendText(b + Environment.NewLine);
+                if (preview.ManualReview.Count > 0)
                 {
                     LogBox.AppendText(Environment.NewLine + "수동 검토 필요:" + Environment.NewLine);
-                    foreach (var m in res.ManualReview) LogBox.AppendText("  " + m + Environment.NewLine);
+                    foreach (var m in preview.ManualReview) LogBox.AppendText("  " + m + Environment.NewLine);
                 }
                 LogBox.ScrollToEnd();
-                StatusText.Text = $"상태: 완료 - catch {res.Modified}건 수정, 수동검토 {res.Skipped_NonTrivial}건, 되돌림 {res.CompileReverted}건 (fix-report.txt 생성)";
-            }
-            catch (Exception ex)
-            {
-                StatusText.Text = "상태: 오류 - " + ex.Message;
+
+                // 3) 수정 대상이 없으면 적용 없이 종료
+                if (preview.Modified == 0)
+                {
+                    System.Windows.MessageBox.Show(
+                        $"수정 대상이 없습니다. (수동검토 {preview.Skipped_NonTrivial}건)",
+                        "미리보기 결과", MessageBoxButton.OK, MessageBoxImage.Information);
+                    StatusText.Text = $"상태: 완료 - 수정 대상 없음 (수동검토 {preview.Skipped_NonTrivial}건)";
+                    return;
+                }
+
+                // 4) 안내된(informed) 확인 — 미리보기 수치 요약 + 되돌리기 경고
+                var confirm = System.Windows.MessageBox.Show(
+                    $"미리보기 결과:\n\n  수정 예정 catch : {preview.Modified}건\n  수동 검토      : {preview.Skipped_NonTrivial}건\n  완전도        : {(preview.IsComplete ? "Complete" : "PARTIAL — 일부 프로젝트/문서 누락")}\n\n위 미리보기(로그창) 내용대로 소스 파일을 직접 수정합니다.\n되돌리려면 git 등 버전관리가 필요합니다.\n\n적용할까요?",
+                    "소스 자동수정 적용", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+                if (confirm != MessageBoxResult.Yes)
+                {
+                    StatusText.Text = "상태: 미리보기만 수행(파일 미변경)";
+                    return;
+                }
+
+                // 5) 적용 (소스 파일 직접 수정 + fix-report.txt 생성)
+                StatusText.Text = "상태: 적용 중...";
+                try
+                {
+                    var res = await Task.Run(() =>
+                    {
+                        var r = global::Program.RunFix(target, apply: true);
+                        global::Program.WriteFixReport(r, true);
+                        return r;
+                    });
+
+                    _lastOutputDir = AppDomain.CurrentDomain.BaseDirectory;
+
+                    LogBox.AppendText(Environment.NewLine + "===== 소스 자동수정 결과 =====" + Environment.NewLine);
+                    foreach (var b in res.PreviewBlocks) LogBox.AppendText(b + Environment.NewLine);
+                    if (res.ManualReview.Count > 0)
+                    {
+                        LogBox.AppendText(Environment.NewLine + "수동 검토 필요:" + Environment.NewLine);
+                        foreach (var m in res.ManualReview) LogBox.AppendText("  " + m + Environment.NewLine);
+                    }
+                    LogBox.ScrollToEnd();
+                    StatusText.Text = $"상태: 완료 - catch {res.Modified}건 수정, 수동검토 {res.Skipped_NonTrivial}건, 되돌림 {res.CompileReverted}건 (fix-report.txt 생성)";
+                }
+                catch (Exception ex)
+                {
+                    StatusText.Text = "상태: 오류 - " + ex.Message;
+                }
             }
             finally
             {
                 global::Program.Log = Console.WriteLine;
+                AnalyzeButton.IsEnabled = true;
+                PickFolderButton.IsEnabled = true;
             }
         }
 
