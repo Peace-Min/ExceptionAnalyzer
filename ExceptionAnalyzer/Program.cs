@@ -128,12 +128,17 @@ internal class Program
         return solutions.Length == 1 ? Path.GetFullPath(solutions[0]) : null;
     }
 
-    private static MSBuildWorkspace OpenSolutionWorkspace(string target, out string solutionPath)
+    private static MSBuildWorkspace OpenSolutionWorkspace(string target, out string solutionPath, Action<string>? onFailure = null)
     {
         EnsureMSBuildRegistered();
         solutionPath = ResolveSolutionPath(target);
         var workspace = MSBuildWorkspace.Create();
-        workspace.WorkspaceFailed += (_, e) => Log($"⚠️ MSBuildWorkspace: {e.Diagnostic.Message}");
+        workspace.WorkspaceFailed += (_, e) =>
+        {
+            Log($"⚠️ MSBuildWorkspace: {e.Diagnostic.Message}");
+            // P1-11: 로드 실패는 완전성(completeness) 판정을 위해 수집한다 (경고는 무시).
+            if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure) onFailure?.Invoke(e.Diagnostic.Message);
+        };
         return workspace;
     }
 
@@ -195,7 +200,19 @@ internal class Program
 
     private static void LoadXmlDocumentation()
     {
-        foreach (var xmlFile in Directory.GetFiles(NET_FRAMEWORK_PATH, "*.xml"))
+        string[] xmlFiles;
+        try
+        {
+            xmlFiles = Directory.GetFiles(NET_FRAMEWORK_PATH, "*.xml");
+        }
+        catch (Exception ex)
+        {
+            // P1-10: 하드코딩 경로가 없어도 크래시 없이 심볼 기반 조회(GetDocumentationCommentXml)로 대체.
+            Log($"⚠️ 기본 XML 문서 경로 없음 — 심볼 기반 조회로 대체: {NET_FRAMEWORK_PATH} ({ex.Message})");
+            return;
+        }
+
+        foreach (var xmlFile in xmlFiles)
         {
             try
             {
@@ -205,7 +222,8 @@ internal class Program
                 foreach (var member in members)
                 {
                     var nameAttr = member.Attribute("name")?.Value;
-                    if (string.IsNullOrEmpty(nameAttr) || !nameAttr.StartsWith("M:")) continue;
+                    // P1-6: 속성(P:)도 포함해 문서화된 예외 조회 대상에 넣는다.
+                    if (string.IsNullOrEmpty(nameAttr) || !(nameAttr.StartsWith("M:") || nameAttr.StartsWith("P:"))) continue;
 
                     var apiDoc = new ApiDocumentation
                     {
@@ -231,6 +249,164 @@ internal class Program
             {
                 Log($"XML 문서 로드 중 오류 발생: {xmlFile}");
                 Log(ex.Message);
+            }
+        }
+    }
+
+    // P1-10: 1차 사전 로드된 v4.7.2/ko 캐시(한글 설명). 2차 심볼의 실제 참조 문서(GetDocumentationCommentXml)
+    // — 대상 TFM/NuGet 문서를 반영. 반환 null = 문서화된 예외 없음.
+    private static Dictionary<string, string>? LookupDocumentedExceptions(ISymbol symbol)
+    {
+        var docId = symbol.GetDocumentationCommentId();
+
+        // 1차: ko 캐시 (한글 설명 우선)
+        if (docId != null && _apiDocCache.TryGetValue(docId, out var cached))
+            return cached.Exceptions.Count > 0 ? cached.Exceptions : null;
+
+        // 2차: 심볼이 참조하는 실제 XML 문서 (대상 TFM/NuGet)
+        string? xml;
+        try { xml = symbol.GetDocumentationCommentXml(expandIncludes: true); }
+        catch { xml = null; }
+        if (string.IsNullOrWhiteSpace(xml)) return null;
+
+        try
+        {
+            // 반환 xml 은 <member ...> 프래그먼트 — 루트로 파싱해 <exception cref="T:..."> 수집
+            var root = XElement.Parse(xml);
+            var dict = new Dictionary<string, string>();
+            foreach (var ex in root.Elements("exception"))
+            {
+                var cref = ex.Attribute("cref")?.Value;
+                if (string.IsNullOrEmpty(cref)) continue;
+                var key = cref.StartsWith("T:") ? cref.Substring(2) : cref;
+                dict[key] = ex.Value.Trim();
+            }
+
+            // 재파싱 방지를 위해 캐시에 적재
+            if (docId != null)
+                _apiDocCache[docId] = new ApiDocumentation { MethodName = docId, Summary = string.Empty, Exceptions = dict };
+
+            return dict.Count > 0 ? dict : null;
+        }
+        catch
+        {
+            return null; // 손상된 문서 프래그먼트 방어
+        }
+    }
+
+    // P1-6/P1-7: try 스코프에서 '실행 시 예외를 던질 수 있는' 노드 수집.
+    // 경계: 람다/무명함수/로컬함수 본문은 정의만으로 실행되지 않으므로 하강 금지.
+    // 중첩 try 의 보호 블록은 내부 catch 가 처리하므로 제외하되, 그 catch/finally 본문은 밖으로 전파되므로 포함.
+    private static void CollectThrowCapable(SyntaxNode node,
+        List<InvocationExpressionSyntax> invocations,
+        List<BaseObjectCreationExpressionSyntax> creations,
+        List<ExpressionSyntax> thrownExpressions,
+        List<ExpressionSyntax> accessExpressions)
+    {
+        foreach (var child in node.ChildNodes())
+        {
+            switch (child)
+            {
+                case AnonymousFunctionExpressionSyntax:
+                case LocalFunctionStatementSyntax:
+                    continue;
+                case TryStatementSyntax nested:
+                    foreach (var c in nested.Catches) CollectThrowCapable(c.Block, invocations, creations, thrownExpressions, accessExpressions);
+                    if (nested.Finally != null) CollectThrowCapable(nested.Finally.Block, invocations, creations, thrownExpressions, accessExpressions);
+                    continue;
+                case InvocationExpressionSyntax inv:
+                    invocations.Add(inv); CollectThrowCapable(inv, invocations, creations, thrownExpressions, accessExpressions); continue;
+                case BaseObjectCreationExpressionSyntax oc:
+                    creations.Add(oc); CollectThrowCapable(oc, invocations, creations, thrownExpressions, accessExpressions); continue;
+                case ThrowStatementSyntax ts:
+                    if (ts.Expression != null) thrownExpressions.Add(ts.Expression);
+                    CollectThrowCapable(ts, invocations, creations, thrownExpressions, accessExpressions); continue;
+                case ThrowExpressionSyntax te:
+                    thrownExpressions.Add(te.Expression); CollectThrowCapable(te, invocations, creations, thrownExpressions, accessExpressions); continue;
+                case MemberAccessExpressionSyntax:
+                case ElementAccessExpressionSyntax:
+                    // 속성/인덱서 후보 — 하강은 계속(내부 호출/생성 놓치지 않도록)
+                    accessExpressions.Add((ExpressionSyntax)child);
+                    CollectThrowCapable(child, invocations, creations, thrownExpressions, accessExpressions); continue;
+                default:
+                    CollectThrowCapable(child, invocations, creations, thrownExpressions, accessExpressions); continue;
+            }
+        }
+    }
+
+    // P1-6: 생성자 호출의 문서화된 예외를 집계. 비프레임워크 생성자는 보고만(생성자 선언은 재귀 분석 대상 아님).
+    private static void CollectFrameworkCreationExceptions(List<BaseObjectCreationExpressionSyntax> creations, SemanticModel semanticModel, Dictionary<string, string> exMap, StreamWriter? writer)
+    {
+        foreach (var oc in creations)
+        {
+            var ctorSymbol = semanticModel.GetSymbolInfo(oc).Symbol as IMethodSymbol;
+            if (ctorSymbol == null) continue;
+
+            var ns = ctorSymbol.ContainingNamespace?.ToDisplayString();
+            if (string.IsNullOrEmpty(ns)) continue;
+
+            if (ns.StartsWith("System") || ns.StartsWith("Microsoft"))
+            {
+                var docExceptions = LookupDocumentedExceptions(ctorSymbol);
+                if (docExceptions == null) continue;
+                foreach (var exception in docExceptions)
+                {
+                    exMap[exception.Key] = exception.Value;
+                    if (writer != null)
+                    {
+                        writer.WriteLine($"        → 예상 예외(생성자): {exception.Key}");
+                        Log($"        → 예상 예외(생성자): {exception.Key}");
+                    }
+                }
+            }
+            else if (writer != null)
+            {
+                var msg = $"프레임워크에 등록되지 않은 API : {ctorSymbol.ContainingNamespace}.{ctorSymbol.ContainingType.Name}.{ctorSymbol.Name}";
+                writer.WriteLine($"    🔧 {msg}(생성자)");
+                Log($"    🔧 {msg}(생성자)");
+            }
+        }
+    }
+
+    // P1-6: try 내부에서 직접 throw 된 예외의 정적 타입을 집계.
+    private static void CollectThrownExpressionTypes(List<ExpressionSyntax> thrownExpressions, SemanticModel semanticModel, Dictionary<string, string> exMap, StreamWriter? writer)
+    {
+        foreach (var expr in thrownExpressions)
+        {
+            var type = semanticModel.GetTypeInfo(expr).Type;
+            if (type == null) continue; // 미해석 타입은 조용히 스킵
+            exMap[type.ToDisplayString()] = "직접 throw된 예외";
+            if (writer != null)
+            {
+                writer.WriteLine($"        → 직접 throw: {type}");
+                Log($"        → 직접 throw: {type}");
+            }
+        }
+    }
+
+    // P1-6: 프레임워크 속성/인덱서 접근의 문서화된 예외를 집계.
+    // 메서드/필드 접근(예: a.B())은 IPropertySymbol 필터로 자연 제외된다.
+    private static void CollectPropertyAccessExceptions(List<ExpressionSyntax> accessExpressions, SemanticModel semanticModel, Dictionary<string, string> exMap, StreamWriter? writer)
+    {
+        foreach (var access in accessExpressions)
+        {
+            var propSymbol = semanticModel.GetSymbolInfo(access).Symbol as IPropertySymbol;
+            if (propSymbol == null) continue;
+
+            var ns = propSymbol.ContainingNamespace?.ToDisplayString();
+            if (string.IsNullOrEmpty(ns)) continue;
+            if (!(ns.StartsWith("System") || ns.StartsWith("Microsoft"))) continue;
+
+            var docExceptions = LookupDocumentedExceptions(propSymbol);
+            if (docExceptions == null) continue;
+            foreach (var exception in docExceptions)
+            {
+                exMap[exception.Key] = exception.Value;
+                if (writer != null)
+                {
+                    writer.WriteLine($"        → 예상 예외(속성): {exception.Key}");
+                    Log($"        → 예상 예외(속성): {exception.Key}");
+                }
             }
         }
     }
@@ -293,10 +469,15 @@ internal class Program
                 foreach (var tryStmt in tryStatements)
                 {
                     var line = tryStmt.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
-                    var methodCalls = tryStmt.Block.DescendantNodes().OfType<InvocationExpressionSyntax>();
-                    if (!methodCalls.Any())
+                    // P1-6/P1-7: 분석 파이프라인과 동일한 수집기로 '예외 유발 노드' 유무 판정.
+                    var dInvocations = new List<InvocationExpressionSyntax>();
+                    var dCreations = new List<BaseObjectCreationExpressionSyntax>();
+                    var dThrown = new List<ExpressionSyntax>();
+                    var dAccess = new List<ExpressionSyntax>();
+                    CollectThrowCapable(tryStmt.Block, dInvocations, dCreations, dThrown, dAccess);
+                    if (dInvocations.Count == 0 && dCreations.Count == 0 && dThrown.Count == 0 && dAccess.Count == 0)
                     {
-                        ReportSkipped(writer, $"{file}:{line} — try 블록에 호출식이 없음");
+                        ReportSkipped(writer, $"{file}:{line} — try 블록에 예외 유발 노드가 없음");
                         continue;
                     }
 
@@ -320,11 +501,16 @@ internal class Program
     {
         var indent = new string(' ', depth * 4); // 재귀 깊이에 따라 들여쓰기
 
-        var internalCalls = methodSyntax.DescendantNodes()
-                                        .OfType<InvocationExpressionSyntax>()
-                                        .ToList();
+        // P1-6/P1-7: 메서드 본문(식 본문 포함)에서 실행 경계를 지키며 예외 유발 노드 수집.
+        var invocations = new List<InvocationExpressionSyntax>();
+        var creations = new List<BaseObjectCreationExpressionSyntax>();
+        var thrownExpressions = new List<ExpressionSyntax>();
+        var accessExpressions = new List<ExpressionSyntax>();
+        SyntaxNode? bodyNode = (SyntaxNode?)methodSyntax.Body ?? methodSyntax.ExpressionBody;
+        if (bodyNode != null)
+            CollectThrowCapable(bodyNode, invocations, creations, thrownExpressions, accessExpressions);
 
-        foreach (var innerCall in internalCalls)
+        foreach (var innerCall in invocations)
         {
             var symbolInfo = semanticModel.GetSymbolInfo(innerCall);
             var innerSymbol = symbolInfo.Symbol as IMethodSymbol
@@ -345,15 +531,9 @@ internal class Program
             var ns = innerSymbol.ContainingNamespace?.ToDisplayString();
             if (ns != null && (ns.StartsWith("System") || ns.StartsWith("Microsoft")))
             {
-                // ③ 정확한 문서 주석 ID로 일치하는 오버로드만 조회 (이름 충돌 과매칭 제거)
-                var docId = innerSymbol.GetDocumentationCommentId();
-                List<ApiDocumentation> matchedDocs;
-                if (docId != null && _apiDocCache.TryGetValue(docId, out var exactDoc))
-                    matchedDocs = new List<ApiDocumentation> { exactDoc };
-                else
-                    matchedDocs = new List<ApiDocumentation>();
-
-                if (matchedDocs.Count == 0)
+                // ③ 정확 docId 매칭 + P1-10 심볼 기반 대체 조회
+                var docExceptions = LookupDocumentedExceptions(innerSymbol);
+                if (docExceptions == null)
                 {
                     if (writer != null)
                     {
@@ -363,28 +543,12 @@ internal class Program
                     continue;
                 }
 
-                var docmentList = new List<ApiDocumentation>();
                 var exceptionList = new List<KeyValuePair<string, string>>();
-
-                foreach (var doc in matchedDocs)
+                foreach (var exception in docExceptions)
                 {
-                    if (doc.Exceptions.Any())
-                    {
-                        foreach (var exception in doc.Exceptions)
-                        {
-                            exMap[exception.Key] = exception.Value;
-
-                            if (!exceptionList.Any(item => item.Key == exception.Key))
-                            {
-                                exceptionList.Add(exception);
-                            }
-                        }
-                    }
-                    else if (writer != null)
-                    {
-                        writer.WriteLine("        📌 문서화된 예외 정보 없음");
-                        Log("        📌 문서화된 예외 정보 없음");
-                    }
+                    exMap[exception.Key] = exception.Value;
+                    if (!exceptionList.Any(item => item.Key == exception.Key))
+                        exceptionList.Add(exception);
                 }
 
                 if (writer != null)
@@ -414,6 +578,11 @@ internal class Program
                 }
             }
         }
+
+        // P1-6+: 생성자·직접 throw·속성/인덱서 예외도 동일 exMap 으로 집계
+        CollectFrameworkCreationExceptions(creations, semanticModel, exMap, writer);
+        CollectThrownExpressionTypes(thrownExpressions, semanticModel, exMap, writer);
+        CollectPropertyAccessExceptions(accessExpressions, semanticModel, exMap, writer);
     }
 
     // ── 추출된 재사용 코어 ① : bin\Debug + net472 기본 어셈블리 참조 목록 생성 (AnalyzeDirectory·RunFix 공용)
@@ -421,12 +590,21 @@ internal class Program
     {
         var references = new List<MetadataReference>();
 
+        // P1-10: 형제 .xml 문서가 있으면 doc provider 를 붙여 폴더 모드에서도 심볼 XML 조회 가능.
+        static MetadataReference Ref(string dllPath)
+        {
+            var xml = Path.ChangeExtension(dllPath, ".xml");
+            return File.Exists(xml)
+                ? MetadataReference.CreateFromFile(dllPath, documentation: XmlDocumentationProvider.CreateFromFile(xml))
+                : MetadataReference.CreateFromFile(dllPath);
+        }
+
         // 현재 프로젝트 bin\Debug 의 dll 추가 (필요 시 net472 등 서브폴더 포함)
         var dllPath = Path.Combine(targetDirectory, "bin", "Debug");
         if (Directory.Exists(dllPath))
         {
             var dlls = Directory.GetFiles(dllPath, "*.dll");
-            var dllReferences = dlls.Select(path => (MetadataReference)MetadataReference.CreateFromFile(path)).ToList();
+            var dllReferences = dlls.Select(path => Ref(path)).ToList();
             references.AddRange(dllReferences);
         }
 
@@ -445,7 +623,7 @@ internal class Program
                         "WindowsBase.dll",
                         "System.Xaml.dll"
                    }
-                   .Select(name => (MetadataReference)MetadataReference.CreateFromFile(Path.Combine(net472Path, name))));
+                   .Select(name => Ref(Path.Combine(net472Path, name))));
 
         return references;
     }
@@ -455,9 +633,14 @@ internal class Program
     {
         var exMap = new Dictionary<string, string>();
 
-        var methodCalls = tryStmt.Block.DescendantNodes().OfType<InvocationExpressionSyntax>();
+        // P1-6/P1-7: 실행 경계(람다/로컬함수/중첩 try 보호블록)를 지키며 예외 유발 노드 수집.
+        var invocations = new List<InvocationExpressionSyntax>();
+        var creations = new List<BaseObjectCreationExpressionSyntax>();
+        var thrownExpressions = new List<ExpressionSyntax>();
+        var accessExpressions = new List<ExpressionSyntax>();
+        CollectThrowCapable(tryStmt.Block, invocations, creations, thrownExpressions, accessExpressions);
 
-        foreach (var call in methodCalls)
+        foreach (var call in invocations)
         {
             var symbolInfo = semanticModel.GetSymbolInfo(call);
             var methodSymbol = symbolInfo.Symbol as IMethodSymbol;
@@ -471,32 +654,16 @@ internal class Program
 
             if (ns.StartsWith("System") || ns.StartsWith("Microsoft"))
             {
-                // ③ 정확한 문서 주석 ID로 일치하는 오버로드만 조회 (이름 충돌 과매칭 제거)
-                var docId = methodSymbol.GetDocumentationCommentId();
-                List<ApiDocumentation> matchedDocs;
-                if (docId != null && _apiDocCache.TryGetValue(docId, out var exactDoc))
-                    matchedDocs = new List<ApiDocumentation> { exactDoc };
-                else
-                    matchedDocs = new List<ApiDocumentation>();
-
-                if (matchedDocs.Count == 0) continue;
+                // ③ 정확 docId 매칭 + P1-10 심볼 기반 대체 조회
+                var docExceptions = LookupDocumentedExceptions(methodSymbol);
+                if (docExceptions == null) continue;
 
                 var exceptionList = new List<KeyValuePair<string, string>>();
-
-                foreach (var doc in matchedDocs)
+                foreach (var exception in docExceptions)
                 {
-                    if (doc.Exceptions.Any())
-                    {
-                        foreach (var exception in doc.Exceptions)
-                        {
-                            exMap[exception.Key] = exception.Value;
-
-                            if (!exceptionList.Any(item => item.Key == exception.Key))
-                            {
-                                exceptionList.Add(exception);
-                            }
-                        }
-                    }
+                    exMap[exception.Key] = exception.Value;
+                    if (!exceptionList.Any(item => item.Key == exception.Key))
+                        exceptionList.Add(exception);
                 }
 
                 if (writer != null)
@@ -534,6 +701,11 @@ internal class Program
                 }
             }
         }
+
+        // P1-6+: 생성자·직접 throw·속성/인덱서 예외도 동일 exMap 으로 집계
+        CollectFrameworkCreationExceptions(creations, semanticModel, exMap, writer);
+        CollectThrownExpressionTypes(thrownExpressions, semanticModel, exMap, writer);
+        CollectPropertyAccessExceptions(accessExpressions, semanticModel, exMap, writer);
 
         return exMap;
     }
@@ -806,6 +978,10 @@ internal class Program
         public int CompileReverted;
         public List<string> PreviewBlocks = new List<string>();
         public List<string> ManualReview = new List<string>();
+        // P1-11: 완전성(completeness) 추적 — 워크스페이스 로드 실패/건너뛴 문서가 있으면 부분 수행.
+        public List<string> WorkspaceFailures = new List<string>();
+        public int SkippedDocuments;
+        public bool IsComplete => WorkspaceFailures.Count == 0 && SkippedDocuments == 0;
     }
 
     // 단일 catch 가 과도하게 넓은지 판정: bare catch {} 또는 선언 타입이 System.Exception.
@@ -858,6 +1034,16 @@ internal class Program
         sb.AppendLine("--- AFTER ---");
         sb.AppendLine(after);
         return sb.ToString();
+    }
+
+    // P1-9: 위치는 라인 시프트 때문에 제외 — Id+메시지 멀티셋 비교로 '같은 ID의 신규 오류'까지 검출.
+    internal static List<string> DiffIntroducedErrors(IEnumerable<Diagnostic> before, IEnumerable<Diagnostic> after)
+    {
+        static string Fp(Diagnostic d) => d.Id + "|" + d.GetMessage();
+        var baseCounts = before.Where(d => d.Severity == DiagnosticSeverity.Error).GroupBy(Fp).ToDictionary(g => g.Key, g => g.Count());
+        return after.Where(d => d.Severity == DiagnosticSeverity.Error).GroupBy(Fp)
+            .Where(g => g.Count() > baseCounts.GetValueOrDefault(g.Key, 0))
+            .Select(g => g.Key).ToList();
     }
 
     private static void ProcessFixRoot(FixResult res, string file, SyntaxNode root, SemanticModel semanticModel, CSharpCompilation compilation, bool apply, Encoding enc, string eol)
@@ -933,21 +1119,18 @@ internal class Program
         var formattedRoot = Microsoft.CodeAnalysis.Formatting.Formatter.Format(newRoot, Microsoft.CodeAnalysis.Formatting.Formatter.Annotation, workspace, options);
         var formattedText = formattedRoot.ToFullString();
 
-        var origErrorIds = compilation.GetDiagnostics()
-            .Where(d => d.Severity == DiagnosticSeverity.Error)
-            .Select(d => d.Id)
-            .ToHashSet();
+        var origDiagnostics = compilation.GetDiagnostics();
 
         var newTree = CSharpSyntaxTree.ParseText(formattedText, (CSharpParseOptions?)root.SyntaxTree.Options, root.SyntaxTree.FilePath, enc);
         var newComp = compilation.ReplaceSyntaxTree(root.SyntaxTree, newTree);
-        var introduced = newComp.GetDiagnostics()
-            .Where(d => d.Severity == DiagnosticSeverity.Error && !origErrorIds.Contains(d.Id))
-            .ToList();
+        // P1-9: Id+메시지 멀티셋 지문으로 신규 오류 검출 (같은 ID의 추가 오류도 잡음).
+        var introduced = DiffIntroducedErrors(origDiagnostics, newComp.GetDiagnostics());
 
         if (introduced.Count > 0)
         {
             res.CompileReverted++;
-            res.ManualReview.Add($"{file} (컴파일 롤백: {string.Join(",", introduced.Select(d => d.Id).Distinct())})");
+            var ids = introduced.Select(fp => fp.Split('|')[0]).Distinct();
+            res.ManualReview.Add($"{file} (컴파일 롤백: {string.Join(",", ids)})");
             return;
         }
 
@@ -977,10 +1160,14 @@ internal class Program
     {
         EnsureCodePagesRegistered();
         var res = new FixResult();
-        using var workspace = OpenSolutionWorkspace(solutionPath, out var resolvedSolutionPath);
+        // P1-11: 워크스페이스 로드 실패를 res 에 수집하려면 res 를 워크스페이스 생성 전에 선언해야 한다.
+        using var workspace = OpenSolutionWorkspace(solutionPath, out var resolvedSolutionPath, msg => res.WorkspaceFailures.Add(msg));
         var solution = workspace.OpenSolutionAsync(resolvedSolutionPath).GetAwaiter().GetResult();
 
         Log($"🔧 솔루션 수정 시작: {resolvedSolutionPath}");
+
+        // P2-12: 링크 파일/다중 프로젝트 컨텍스트로 같은 물리 파일이 반복 등장하면 최초 1회만 수정.
+        var processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
         {
@@ -988,6 +1175,7 @@ internal class Program
             if (compilation == null)
             {
                 res.ManualReview.Add($"{project.Name} (건너뜀: 프로젝트 컴파일 생성 실패)");
+                res.SkippedDocuments += project.Documents.Count();
                 continue;
             }
 
@@ -996,11 +1184,22 @@ internal class Program
                 var file = document.FilePath;
                 if (string.IsNullOrWhiteSpace(file) || !File.Exists(file))
                 {
+                    // P1-11: 조용한 continue 대신 완전성 판정을 위해 건너뜀을 기록.
+                    res.SkippedDocuments++;
+                    res.ManualReview.Add($"{document.Name} (건너뜀: 파일 경로 없음)");
                     continue;
                 }
 
                 // FIX 5: obj/bin/.git·생성 파일 제외
                 if (IsExcludedSourcePath(file)) continue;
+
+                // P2-12: 물리 경로 기준 중복 제거
+                var full = Path.GetFullPath(file);
+                if (!processedFiles.Add(full))
+                {
+                    res.ManualReview.Add($"{full} (중복 프로젝트 컨텍스트 — 최초 1회만 수정)");
+                    continue;
+                }
 
                 var root = document.GetSyntaxRootAsync().GetAwaiter().GetResult();
                 if (root == null)
@@ -1071,7 +1270,15 @@ internal class Program
         sb.AppendLine($"Skipped_Empty       : {res.Skipped_Empty}");
         sb.AppendLine($"Skipped_NotBroad    : {res.Skipped_NotBroad}");
         sb.AppendLine($"CompileReverted     : {res.CompileReverted}");
+        sb.AppendLine($"SkippedDocuments    : {res.SkippedDocuments}");
+        sb.AppendLine($"Completeness       : {(res.IsComplete ? "Complete" : "PARTIAL")}");
         sb.AppendLine();
+        if (res.WorkspaceFailures.Count > 0)
+        {
+            sb.AppendLine("----- WORKSPACE FAILURES -----");
+            foreach (var wf in res.WorkspaceFailures) sb.AppendLine(wf);
+            sb.AppendLine();
+        }
         sb.AppendLine("----- PREVIEW BLOCKS -----");
         foreach (var b in res.PreviewBlocks)
         {
@@ -1340,8 +1547,105 @@ internal class Program
             bool t12 = bytesEqual && exRes.Modified == 0;
             L($"[12] excluded paths (obj\\Gen.g.cs 미변경): {(t12 ? "PASS" : "FAIL")} (bytesEqual={bytesEqual}, Modified={exRes.Modified})");
 
+            // ── [13] 생성자 예외 수집 : StreamWriter(string) 생성자 문서 예외가 구체 catch 로 반영 ──
+            var ctorDir = Path.Combine(fixtureDir, "ctor");
+            Directory.CreateDirectory(ctorDir);
+            var ctorPath = Path.Combine(ctorDir, "Ctor.cs");
+            File.WriteAllText(ctorPath,
+                "using System;\n" +
+                "class Ct {\n" +
+                "    void M(string s) {\n" +
+                "        try { var sw = new System.IO.StreamWriter(s); sw.Dispose(); } catch (Exception ex) { Log(ex); }\n" +
+                "    }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var ctorRes = RunFix(ctorDir, true, allowSourceOnlyFallback: true);
+            var ctorText = File.ReadAllText(ctorPath);
+            bool ctorHasIoException =
+                   ctorText.Contains("catch (System.UnauthorizedAccessException")
+                || ctorText.Contains("catch (System.IO.IOException")
+                || ctorText.Contains("catch (System.IO.DirectoryNotFoundException");
+            bool t13 = ctorRes.Modified >= 1 && ctorHasIoException && !ctorText.Contains("catch (Exception ");
+            L("--- Ctor.cs (after) ---");
+            L(ctorText);
+            L($"[13] 생성자 예외 수집: {(t13 ? "PASS" : "FAIL")} (Modified={ctorRes.Modified}, ioCatch={ctorHasIoException})");
+
+            // ── [14] 직접 throw 수집 : try 내부 throw new InvalidOperationException 이 구체 catch 로 반영 ──
+            var throwDir = Path.Combine(fixtureDir, "throwex");
+            Directory.CreateDirectory(throwDir);
+            var throwPath = Path.Combine(throwDir, "ThrowEx.cs");
+            File.WriteAllText(throwPath,
+                "using System;\n" +
+                "class Te {\n" +
+                "    void M(string s) {\n" +
+                "        try { if (s == null) throw new InvalidOperationException(\"x\"); int.Parse(s); } catch (Exception ex) { Log(ex); }\n" +
+                "    }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var throwRes = RunFix(throwDir, true, allowSourceOnlyFallback: true);
+            var throwText = File.ReadAllText(throwPath);
+            bool t14 = throwRes.Modified >= 1 && throwText.Contains("catch (System.InvalidOperationException");
+            L($"[14] 직접 throw 수집: {(t14 ? "PASS" : "FAIL")} (Modified={throwRes.Modified})");
+
+            // ── [15] 람다 경계 : 람다 내부 int.Parse 는 수집 제외 → FormatException 부재, 파일 불변 ──
+            var lambdaDir = Path.Combine(fixtureDir, "lambda");
+            Directory.CreateDirectory(lambdaDir);
+            var lambdaPath = Path.Combine(lambdaDir, "Lam.cs");
+            File.WriteAllText(lambdaPath,
+                "using System;\n" +
+                "class Lm {\n" +
+                "    void M(string s) {\n" +
+                "        try { Func<string, int> f = t => int.Parse(t); GC.KeepAlive(f); } catch (Exception ex) { Log(ex); }\n" +
+                "    }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var lambdaBefore = File.ReadAllText(lambdaPath);
+            var lambdaRes = RunFix(lambdaDir, true, allowSourceOnlyFallback: true);
+            var lambdaText = File.ReadAllText(lambdaPath);
+            bool lambdaUnchanged = lambdaText == lambdaBefore;
+            bool t15 = !lambdaText.Contains("FormatException") && lambdaUnchanged;
+            L($"[15] 람다 경계: {(t15 ? "PASS" : "FAIL")} (unchanged={lambdaUnchanged}, Skipped_Empty={lambdaRes.Skipped_Empty})");
+
+            // ── [16] 중첩 try 보호블록 경계 : 외부는 내부 보호블록의 int.Parse 예외를 상속하지 않음 ──
+            var nestGuardDir = Path.Combine(fixtureDir, "nestguard");
+            Directory.CreateDirectory(nestGuardDir);
+            var nestGuardPath = Path.Combine(nestGuardDir, "NestGuard.cs");
+            File.WriteAllText(nestGuardPath,
+                "using System;\n" +
+                "class Ng {\n" +
+                "    void M(string s) {\n" +
+                "        try { try { int a = int.Parse(s); } catch (FormatException fe) { GC.KeepAlive(fe); } } catch (Exception ex) { Log(ex); }\n" +
+                "    }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var nestGuardBefore = File.ReadAllText(nestGuardPath);
+            var nestGuardRes = RunFix(nestGuardDir, true, allowSourceOnlyFallback: true);
+            var nestGuardText = File.ReadAllText(nestGuardPath);
+            int outerBroadCount = System.Text.RegularExpressions.Regex.Matches(nestGuardText, @"catch \(Exception ex\)").Count;
+            bool t16 = outerBroadCount == 1 && !nestGuardText.Contains("OverflowException") && nestGuardText == nestGuardBefore;
+            L($"[16] 중첩 try 보호블록 경계: {(t16 ? "PASS" : "FAIL")} (broadCount={outerBroadCount}, noOverflow={!nestGuardText.Contains("OverflowException")}, unchanged={nestGuardText == nestGuardBefore})");
+
+            // ── [17] 진단 지문 : 같은 CS0029 오류가 1→2 개로 늘면 신규 오류로 검출 (구 ID-set 로직은 미검출) ──
+            var fpNet472 = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\";
+            var fpRefs = new[] { "mscorlib.dll", "System.dll", "System.Core.dll" }
+                .Select(n => (MetadataReference)MetadataReference.CreateFromFile(Path.Combine(fpNet472, n)))
+                .ToList();
+            var fpComp1 = CSharpCompilation.Create("fp1")
+                .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+                .AddReferences(fpRefs)
+                .AddSyntaxTrees(CSharpSyntaxTree.ParseText("class F1 { void M() { int x = \"a\"; } }"));
+            var fpComp2 = CSharpCompilation.Create("fp2")
+                .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+                .AddReferences(fpRefs)
+                .AddSyntaxTrees(CSharpSyntaxTree.ParseText("class F2 { void M() { int x = \"a\"; int y = \"b\"; } }"));
+            var fpIntroduced = DiffIntroducedErrors(fpComp1.GetDiagnostics(), fpComp2.GetDiagnostics());
+            var fpSame = DiffIntroducedErrors(fpComp1.GetDiagnostics(), fpComp1.GetDiagnostics());
+            bool t17 = fpIntroduced.Count > 0 && fpSame.Count == 0;
+            L($"[17] 진단 지문: {(t17 ? "PASS" : "FAIL")} (introduced={fpIntroduced.Count}, sameSame={fpSame.Count})");
+
             allPass = previewUnchanged && t1 && t2 && t3 && t4 && t5 && t6
-                   && t7 && t8 && t9 && t10 && t11 && t12;
+                   && t7 && t8 && t9 && t10 && t11 && t12
+                   && t13 && t14 && t15 && t16 && t17;
             L(allPass ? "SELFTEST-FIX PASS" : "SELFTEST-FIX FAIL");
         }
         catch (Exception ex)

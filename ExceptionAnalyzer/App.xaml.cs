@@ -28,7 +28,8 @@ namespace ExceptionAnalyzer
                     global::Program.Log = Console.WriteLine;
                     var res = global::Program.RunFix(e.Args[1], apply, sourceOnly);
                     global::Program.WriteFixReport(res, apply);
-                    Shutdown(0);
+                    // P1-11: 부분 수행(워크스페이스 실패/문서 건너뜀)은 exit 2 로 구분.
+                    Shutdown(res.IsComplete ? 0 : 2);
                 }
                 catch (Exception ex) { Console.WriteLine("FIX ERROR: " + ex); Shutdown(1); }
                 return;
