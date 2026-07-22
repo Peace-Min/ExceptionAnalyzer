@@ -26,7 +26,20 @@ namespace ExceptionAnalyzer
                 try
                 {
                     global::Program.Log = Console.WriteLine;
-                    var res = global::Program.RunFix(e.Args[1], apply, sourceOnly);
+                    global::Program.FixResult res;
+                    if (apply)
+                    {
+                        var preview = global::Program.RunFix(e.Args[1], apply: false, sourceOnly);
+                        if (!preview.IsComplete)
+                        {
+                            global::Program.WriteFixReport(preview, apply: false);
+                            Console.WriteLine("FIX BLOCKED: Completeness=PARTIAL 상태에서는 --apply를 수행하지 않습니다. fix-report.txt의 WORKSPACE FAILURES와 MANUAL REVIEW를 먼저 확인하세요.");
+                            Shutdown(2);
+                            return;
+                        }
+                    }
+
+                    res = global::Program.RunFix(e.Args[1], apply, sourceOnly);
                     global::Program.WriteFixReport(res, apply);
                     // P1-11: 부분 수행(워크스페이스 실패/문서 건너뜀)은 exit 2 로 구분.
                     Shutdown(res.IsComplete ? 0 : 2);

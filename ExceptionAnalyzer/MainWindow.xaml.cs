@@ -78,6 +78,16 @@ namespace ExceptionAnalyzer
                     return;
                 }
 
+                if (!preview.IsComplete)
+                {
+                    global::Program.WriteFixReport(preview, apply: false);
+                    System.Windows.MessageBox.Show(
+                        "일부 프로젝트 또는 문서를 완전히 로드하지 못해 자동수정을 적용하지 않습니다.\n\nfix-report.txt의 WORKSPACE FAILURES와 수동 검토 목록을 먼저 확인하세요.",
+                        "부분 분석 결과 - 적용 차단", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    StatusText.Text = "상태: 미리보기 완료 - 부분 분석이라 적용 차단";
+                    return;
+                }
+
                 // 4) 안내된(informed) 확인 — 미리보기 수치 요약 + 되돌리기 경고
                 var confirm = System.Windows.MessageBox.Show(
                     $"미리보기 결과:\n\n  수정 예정 catch : {preview.Modified}건\n  수동 검토      : {preview.Skipped_NonTrivial}건\n  완전도        : {(preview.IsComplete ? "Complete" : "PARTIAL — 일부 프로젝트/문서 누락")}\n\n위 미리보기(로그창) 내용대로 소스 파일을 직접 수정합니다.\n되돌리려면 git 등 버전관리가 필요합니다.\n\n적용할까요?",

@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Xunit;
 
 namespace ExceptionAnalyzer.Tests
@@ -27,7 +28,7 @@ namespace ExceptionAnalyzer.Tests
             Assert.Equal(0, global::Program.RunSelfTestHeadless("--selftest-xml"));
         }
 
-        // FIX 엔진 종단 게이트(preview/apply·인코딩·중첩·경계 등 17개 항목).
+        // FIX 엔진 종단 게이트(preview/apply·인코딩·중첩·경계 등 21개 항목).
         [Fact]
         public void SelfTest_Fix_Passes()
         {
@@ -57,6 +58,88 @@ namespace ExceptionAnalyzer.Tests
             var same = global::Program.DiffIntroducedErrors(
                 oneError.GetDiagnostics(), oneError.GetDiagnostics());
             Assert.Empty(same);
+        }
+
+        [Fact]
+        public void RunFix_SourceOnlyApplyBlocked_DoesNotWrite()
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "ea_xunit_sourceonly_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var file = Path.Combine(dir, "Gate.cs");
+                var source = "using System; class C { void M(string s) { try { int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }";
+                File.WriteAllText(file, source);
+
+                var result = global::Program.RunFix(dir, apply: true, allowSourceOnlyFallback: true);
+
+                Assert.False(result.IsComplete);
+                Assert.Contains(result.CoverageWarnings, m => m.Contains("source-only"));
+                Assert.Contains(result.ManualReview, m => m.Contains("적용 차단"));
+                Assert.Equal(source, File.ReadAllText(file));
+            }
+            finally
+            {
+                if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        [Fact]
+        public void AnalyzeTryBlock_NestedTryPropagatesOnlyUnhandledExceptions()
+        {
+            var source = @"
+using System;
+class C {
+    void M() {
+        try {
+            try {
+                if (DateTime.Now.Ticks > 0) throw new FormatException();
+                throw new OverflowException();
+            }
+            catch (FormatException) { }
+        }
+        catch { }
+    }
+}";
+            var tree = CSharpSyntaxTree.ParseText(source);
+            var compilation = CSharpCompilation.Create("nested")
+                .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+                .AddReferences(RuntimeRefs())
+                .AddSyntaxTrees(tree);
+            var model = compilation.GetSemanticModel(tree);
+            var root = tree.GetRoot();
+            var outerTry = root.DescendantNodes().OfType<TryStatementSyntax>().First();
+
+            var result = global::Program.AnalyzeTryBlock(outerTry, model, compilation: compilation);
+
+            Assert.Contains("System.OverflowException", result.Keys);
+            Assert.DoesNotContain("System.FormatException", result.Keys);
+        }
+
+        [Fact]
+        public void RunFix_UnsupportedExecutionCoverageBlocksApply()
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "ea_xunit_unsupported_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var file = Path.Combine(dir, "Unsupported.cs");
+                var source =
+                    "using System; using System.Collections.Generic; " +
+                    "struct Risky { public static Risky operator +(Risky a, Risky b) => throw new InvalidOperationException(); } " +
+                    "class C { void M(IEnumerable<int> xs) { try { var r = new Risky() + new Risky(); foreach (var x in xs) { } } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }";
+                File.WriteAllText(file, source);
+
+                var result = global::Program.RunFix(dir, apply: true, allowSourceOnlyFallback: true);
+
+                Assert.False(result.IsComplete);
+                Assert.Contains(result.CoverageWarnings, m => m.Contains("미지원 실행 지점"));
+                Assert.Equal(source, File.ReadAllText(file));
+            }
+            finally
+            {
+                if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            }
         }
 
         // 현재 런타임의 전체 참조 어셈블리(BCL 포함)를 메타데이터 참조로 구성 — int/string 바인딩 보장.

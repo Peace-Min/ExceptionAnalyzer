@@ -13,6 +13,133 @@ using System.Text;
 
 internal partial class Program
 {
+    internal sealed class SemanticContext
+    {
+        public SemanticContext(CSharpCompilation compilation, SemanticModel model)
+        {
+            Compilation = compilation;
+            Model = model;
+        }
+
+        public CSharpCompilation Compilation { get; }
+        public SemanticModel Model { get; }
+    }
+
+    internal sealed class MethodContext
+    {
+        public MethodContext(MethodDeclarationSyntax syntax, SemanticContext semanticContext)
+        {
+            Syntax = syntax;
+            SemanticContext = semanticContext;
+        }
+
+        public MethodDeclarationSyntax Syntax { get; }
+        public SemanticContext SemanticContext { get; }
+    }
+
+    private static string MethodKey(IMethodSymbol symbol) =>
+        symbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat);
+
+    private static Dictionary<SyntaxTree, SemanticContext> BuildSemanticContextMap(Solution solution)
+    {
+        var map = new Dictionary<SyntaxTree, SemanticContext>();
+        foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        {
+            var compilation = project.GetCompilationAsync().GetAwaiter().GetResult() as CSharpCompilation;
+            if (compilation == null) continue;
+
+            foreach (var tree in compilation.SyntaxTrees)
+                map[tree] = new SemanticContext(compilation, compilation.GetSemanticModel(tree));
+        }
+        return map;
+    }
+
+    private static Dictionary<string, MethodContext> BuildMethodContextMap(Dictionary<SyntaxTree, SemanticContext> semanticContexts)
+    {
+        var map = new Dictionary<string, MethodContext>(StringComparer.Ordinal);
+        foreach (var item in semanticContexts)
+        {
+            var root = item.Key.GetRoot();
+            foreach (var method in root.DescendantNodes().OfType<MethodDeclarationSyntax>())
+            {
+                var symbol = item.Value.Model.GetDeclaredSymbol(method) as IMethodSymbol;
+                if (symbol == null) continue;
+                map[MethodKey(symbol)] = new MethodContext(method, item.Value);
+            }
+        }
+        return map;
+    }
+
+    private static SemanticContext? ResolveSemanticContext(SyntaxTree tree, CSharpCompilation? fallbackCompilation, SemanticModel fallbackModel, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts)
+    {
+        if (tree == fallbackModel.SyntaxTree)
+            return new SemanticContext((CSharpCompilation)fallbackModel.Compilation, fallbackModel);
+
+        if (fallbackCompilation != null && fallbackCompilation.ContainsSyntaxTree(tree))
+            return new SemanticContext(fallbackCompilation, fallbackCompilation.GetSemanticModel(tree));
+
+        if (semanticContexts != null && semanticContexts.TryGetValue(tree, out var context))
+            return context;
+
+        return null;
+    }
+
+    private static MethodContext? ResolveMethodContext(IMethodSymbol symbol, CSharpCompilation? fallbackCompilation, SemanticModel fallbackModel, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts, IReadOnlyDictionary<string, MethodContext>? methodContexts)
+    {
+        var methodSyntax = symbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() as MethodDeclarationSyntax;
+        if (methodSyntax != null)
+        {
+            var semanticContext = ResolveSemanticContext(methodSyntax.SyntaxTree, fallbackCompilation, fallbackModel, semanticContexts);
+            if (semanticContext != null)
+                return new MethodContext(methodSyntax, semanticContext);
+        }
+
+        if (methodContexts != null && methodContexts.TryGetValue(MethodKey(symbol), out var context))
+            return context;
+
+        return null;
+    }
+
+    private static bool IsCaughtBy(CSharpCompilation compilation, string exceptionFullName, CatchClauseSyntax catchClause, SemanticModel catchSemanticModel)
+    {
+        if (catchClause.Filter != null) return false;
+        if (catchClause.Declaration == null) return true;
+
+        var thrownType = compilation.GetTypeByMetadataName(exceptionFullName);
+        var catchType = catchSemanticModel.GetTypeInfo(catchClause.Declaration.Type).Type as INamedTypeSymbol;
+        if (thrownType == null || catchType == null) return false;
+
+        for (var t = thrownType; t != null; t = t.BaseType)
+            if (SymbolEqualityComparer.Default.Equals(t, catchType)) return true;
+
+        return false;
+    }
+
+    private static void AddNestedUnhandledExceptions(TryStatementSyntax tryStmt, SemanticModel semanticModel, StreamWriter? writer, StreamWriter? exceptionWriter, CSharpCompilation? compilation, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts, IReadOnlyDictionary<string, MethodContext>? methodContexts, Dictionary<string, string> exMap)
+    {
+        var nestedTries = tryStmt.Block.DescendantNodes(n => n == tryStmt.Block || n is not AnonymousFunctionExpressionSyntax and not LocalFunctionStatementSyntax)
+            .OfType<TryStatementSyntax>()
+            .ToList();
+
+        foreach (var nested in nestedTries)
+        {
+            var nestedMap = AnalyzeBlockExceptions(nested.Block, semanticModel, writer: null, exceptionWriter, compilation, semanticContexts, methodContexts);
+            foreach (var exception in nestedMap)
+            {
+                var handled = nested.Catches.Any(c => IsCaughtBy((CSharpCompilation)semanticModel.Compilation, exception.Key, c, semanticModel));
+                if (!handled)
+                {
+                    exMap[exception.Key] = "중첩 try에서 외부로 전파 가능: " + exception.Value;
+                    if (writer != null)
+                    {
+                        writer.WriteLine($"        → 중첩 try 미처리 전파: {exception.Key}");
+                        Log($"        → 중첩 try 미처리 전파: {exception.Key}");
+                    }
+                }
+            }
+        }
+    }
+
     // P1-6/P1-7: try 스코프에서 '실행 시 예외를 던질 수 있는' 노드 수집.
     // 경계: 람다/무명함수/로컬함수 본문은 정의만으로 실행되지 않으므로 하강 금지.
     // 중첩 try 의 보호 블록은 내부 catch 가 처리하므로 제외하되, 그 catch/finally 본문은 밖으로 전파되므로 포함.
@@ -147,6 +274,8 @@ internal partial class Program
 
         using var workspace = OpenSolutionWorkspace(targetDirectory, out var solutionPath);
         var solution = workspace.OpenSolutionAsync(solutionPath).GetAwaiter().GetResult();
+        var semanticContexts = BuildSemanticContextMap(solution);
+        var methodContexts = BuildMethodContextMap(semanticContexts);
         var lastFolderName = Path.GetFileNameWithoutExtension(solutionPath);
 
         // 2. 출력 파일 경로 지정
@@ -203,7 +332,7 @@ internal partial class Program
                     var message = $"📄 파일: {file}, 줄: {line} → try 블록 내부 API 호출:";
                     Log(message);
                     writer.WriteLine(message);
-                    methodExceptionList = AnalyzeTryBlock(tryStmt, semanticModel, writer, exceptionWriter, compilation);
+                    methodExceptionList = AnalyzeTryBlock(tryStmt, semanticModel, writer, exceptionWriter, compilation, semanticContexts, methodContexts);
                     EmitOrderedCatches(writer, compilation, methodExceptionList);
                 }
             }
@@ -216,7 +345,7 @@ internal partial class Program
     }
 
     // exMap 에 집계, writer/exceptionWriter 는 nullable — null 이면 파일/로그 출력 없이 순수 집계만 수행(RunFix 재사용).
-    private static void AnalyzeInternalMethod(MethodDeclarationSyntax methodSyntax, SemanticModel semanticModel, StreamWriter? writer, StreamWriter? exceptionWriter, CSharpCompilation? compilation, string callerFullName, int depth, Dictionary<string, string> exMap)
+    private static void AnalyzeInternalMethod(MethodDeclarationSyntax methodSyntax, SemanticModel semanticModel, StreamWriter? writer, StreamWriter? exceptionWriter, CSharpCompilation? compilation, string callerFullName, int depth, Dictionary<string, string> exMap, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts = null, IReadOnlyDictionary<string, MethodContext>? methodContexts = null)
     {
         var indent = new string(' ', depth * 4); // 재귀 깊이에 따라 들여쓰기
 
@@ -248,7 +377,7 @@ internal partial class Program
 
             // 프레임워크 API 예외 추론
             var ns = innerSymbol.ContainingNamespace?.ToDisplayString();
-            if (ns != null && (ns.StartsWith("System") || ns.StartsWith("Microsoft")))
+            if (IsFrameworkNamespace(ns))
             {
                 // ③ 정확 docId 매칭 + P1-10 심볼 기반 대체 조회
                 var docExceptions = LookupDocumentedExceptions(innerSymbol);
@@ -282,19 +411,13 @@ internal partial class Program
             else
             {
                 // 중첩 사용자 정의 메서드면 재귀 호출
-                var nextMethodSyntax = innerSymbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() as MethodDeclarationSyntax;
-                if (nextMethodSyntax != null && depth < 5) // 최대 재귀 제한
+                var nextMethodContext = ResolveMethodContext(innerSymbol, compilation, semanticModel, semanticContexts, methodContexts);
+                if (nextMethodContext != null && depth < 5) // 최대 재귀 제한
                 {
-                    // FIX 2: 타 프로젝트/외부 정의 트리를 현재 컴파일의 GetSemanticModel 에 넘기면 ArgumentException.
-                    var declTree = nextMethodSyntax.SyntaxTree;
-                    SemanticModel? nextModel = null;
-                    if (declTree == semanticModel.SyntaxTree) nextModel = semanticModel;
-                    else if (compilation != null && compilation.ContainsSyntaxTree(declTree)) nextModel = compilation.GetSemanticModel(declTree);
-                    if (nextModel != null)
-                        AnalyzeInternalMethod(nextMethodSyntax, nextModel, writer, exceptionWriter, compilation, methodFullName, depth + 1, exMap);
-                    else
-                        ReportSkipped(writer, $"    ⤷ 재귀 분석 생략(타 프로젝트/외부 정의): {methodFullName}");
+                    AnalyzeInternalMethod(nextMethodContext.Syntax, nextMethodContext.SemanticContext.Model, writer, exceptionWriter, nextMethodContext.SemanticContext.Compilation, methodFullName, depth + 1, exMap, semanticContexts, methodContexts);
                 }
+                else if (nextMethodContext == null)
+                    ReportSkipped(writer, $"    ⤷ 재귀 분석 생략(타 프로젝트/외부 정의): {methodFullName}");
             }
         }
 
@@ -348,7 +471,7 @@ internal partial class Program
     }
 
     // ── 추출된 재사용 코어 ② : try 블록 내부 예외 집계 (type→한글설명 맵). writer 가 null 이면 순수 집계(무출력).
-    public static Dictionary<string, string> AnalyzeTryBlock(TryStatementSyntax tryStmt, SemanticModel semanticModel, StreamWriter? writer = null, StreamWriter? exceptionWriter = null, CSharpCompilation? compilation = null)
+    private static Dictionary<string, string> AnalyzeBlockExceptions(SyntaxNode blockNode, SemanticModel semanticModel, StreamWriter? writer = null, StreamWriter? exceptionWriter = null, CSharpCompilation? compilation = null, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts = null, IReadOnlyDictionary<string, MethodContext>? methodContexts = null)
     {
         var exMap = new Dictionary<string, string>();
 
@@ -357,21 +480,21 @@ internal partial class Program
         var creations = new List<BaseObjectCreationExpressionSyntax>();
         var thrownExpressions = new List<ExpressionSyntax>();
         var accessExpressions = new List<ExpressionSyntax>();
-        CollectThrowCapable(tryStmt.Block, invocations, creations, thrownExpressions, accessExpressions);
+        CollectThrowCapable(blockNode, invocations, creations, thrownExpressions, accessExpressions);
 
         foreach (var call in invocations)
         {
             var symbolInfo = semanticModel.GetSymbolInfo(call);
-            var methodSymbol = symbolInfo.Symbol as IMethodSymbol;
+            var methodSymbol = symbolInfo.Symbol as IMethodSymbol
+                            ?? symbolInfo.CandidateSymbols.FirstOrDefault() as IMethodSymbol;
 
             if (methodSymbol == null) continue;
 
             var ns = methodSymbol.ContainingNamespace?.ToDisplayString();
-            if (string.IsNullOrEmpty(ns)) continue;
 
             var methodFullName = $"{methodSymbol.ContainingNamespace}.{methodSymbol.ContainingType.Name}.{methodSymbol.Name}";
 
-            if (ns.StartsWith("System") || ns.StartsWith("Microsoft"))
+            if (IsFrameworkNamespace(ns))
             {
                 // ③ 정확 docId 매칭 + P1-10 심볼 기반 대체 조회
                 var docExceptions = LookupDocumentedExceptions(methodSymbol);
@@ -404,20 +527,13 @@ internal partial class Program
                 }
 
                 // 해당 메서드 정의 위치를 찾음 (재귀 분석용)
-                var methodDeclSyntax = methodSymbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() as MethodDeclarationSyntax;
-
-                if (methodDeclSyntax != null)
+                var methodContext = ResolveMethodContext(methodSymbol, compilation, semanticModel, semanticContexts, methodContexts);
+                if (methodContext != null)
                 {
-                    // FIX 2: 타 프로젝트/외부 정의 트리를 현재 컴파일의 GetSemanticModel 에 넘기면 ArgumentException.
-                    var declTree = methodDeclSyntax.SyntaxTree;
-                    SemanticModel? methodModel = null;
-                    if (declTree == semanticModel.SyntaxTree) methodModel = semanticModel;
-                    else if (compilation != null && compilation.ContainsSyntaxTree(declTree)) methodModel = compilation.GetSemanticModel(declTree);
-                    if (methodModel != null)
-                        AnalyzeInternalMethod(methodDeclSyntax, methodModel, writer, exceptionWriter, compilation, methodFullName, 1, exMap);
-                    else
-                        ReportSkipped(writer, $"    ⤷ 재귀 분석 생략(타 프로젝트/외부 정의): {methodFullName}");
+                    AnalyzeInternalMethod(methodContext.Syntax, methodContext.SemanticContext.Model, writer, exceptionWriter, methodContext.SemanticContext.Compilation, methodFullName, 1, exMap, semanticContexts, methodContexts);
                 }
+                else
+                    ReportSkipped(writer, $"    ⤷ 재귀 분석 생략(타 프로젝트/외부 정의): {methodFullName}");
             }
         }
 
@@ -426,6 +542,13 @@ internal partial class Program
         CollectThrownExpressionTypes(thrownExpressions, semanticModel, exMap, writer);
         CollectPropertyAccessExceptions(accessExpressions, semanticModel, exMap, writer);
 
+        return exMap;
+    }
+
+    public static Dictionary<string, string> AnalyzeTryBlock(TryStatementSyntax tryStmt, SemanticModel semanticModel, StreamWriter? writer = null, StreamWriter? exceptionWriter = null, CSharpCompilation? compilation = null, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts = null, IReadOnlyDictionary<string, MethodContext>? methodContexts = null)
+    {
+        var exMap = AnalyzeBlockExceptions(tryStmt.Block, semanticModel, writer, exceptionWriter, compilation, semanticContexts, methodContexts);
+        AddNestedUnhandledExceptions(tryStmt, semanticModel, writer, exceptionWriter, compilation, semanticContexts, methodContexts, exMap);
         return exMap;
     }
 

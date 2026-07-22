@@ -26,10 +26,18 @@ internal partial class Program
         public int CompileReverted;
         public List<string> PreviewBlocks = new List<string>();
         public List<string> ManualReview = new List<string>();
+        internal List<PendingWrite> PendingWrites = new List<PendingWrite>();
         // P1-11: 완전성(completeness) 추적 — 워크스페이스 로드 실패/건너뛴 문서가 있으면 부분 수행.
         public List<string> WorkspaceFailures = new List<string>();
+        public List<string> CoverageWarnings = new List<string>();
         public int SkippedDocuments;
-        public bool IsComplete => WorkspaceFailures.Count == 0 && SkippedDocuments == 0;
+        public bool IsComplete => WorkspaceFailures.Count == 0 && CoverageWarnings.Count == 0 && SkippedDocuments == 0;
+
+        public void AddCoverageWarning(string message)
+        {
+            if (!CoverageWarnings.Contains(message, StringComparer.OrdinalIgnoreCase))
+                CoverageWarnings.Add(message);
+        }
     }
 
     // 단일 catch 가 과도하게 넓은지 판정: bare catch {} 또는 선언 타입이 System.Exception.
@@ -54,17 +62,48 @@ internal partial class Program
 
     // 원본 try 를 유지하고 catch 절만 정렬된 구체 예외들로 교체한 새 TryStatement 를 생성.
     // original 은 (자식 fix 가 이미 반영된) rewritten try 일 수 있으며, 그 .Block/.Finally 를 그대로 사용해 자식 fix 를 보존한다.
-    private static TryStatementSyntax BuildReplacementTry(TryStatementSyntax original, List<string> fullTypeNames, string eol)
+    private static TryStatementSyntax BuildReplacementTry(TryStatementSyntax original, CatchClauseSyntax originalCatch, List<string> fullTypeNames, string eol)
     {
+        var originalExceptionName = originalCatch.Declaration?.Identifier.ValueText;
+        var generatedExceptionName = string.IsNullOrWhiteSpace(originalExceptionName) ? "ex" : "__autoCatchEx";
+
+        string ReplacementBody()
+        {
+            if (originalCatch.Block.Statements.Count == 0)
+                return "{ /* [AUTO-CATCH] 원본 빈 catch */ }";
+
+            if (originalCatch.Declaration == null || string.IsNullOrWhiteSpace(originalExceptionName))
+                return originalCatch.Block.ToString();
+
+            var originalTypeText = originalCatch.Declaration.Type.ToString();
+            var bodyText = originalCatch.Block.ToString();
+            var open = bodyText.IndexOf('{');
+            var close = bodyText.LastIndexOf('}');
+            if (open < 0 || close <= open) return bodyText;
+
+            var inner = bodyText.Substring(open + 1, close - open - 1);
+            return "{" + eol
+                + $"    {originalTypeText} {originalExceptionName} = {generatedExceptionName};"
+                + inner
+                + eol
+                + "}";
+        }
+
+        var replacementBody = ReplacementBody();
+
         var sb = new StringBuilder();
         sb.Append("try ");
         sb.Append(original.Block.ToString()); // try 본문 그대로 (변경 없음)
         sb.Append(eol);
         foreach (var t in fullTypeNames)
         {
-            // 완전수식 타입 + 완전수식 Debug 호출 (using 추가 없음)
-            sb.Append($"catch ({t} ex) {{ System.Diagnostics.Debug.WriteLine(ex); /* [AUTO-CATCH] 로거로 교체 */ }}").Append(eol);
+            // 완전수식 타입 + 기존 안전 catch 본문 보존. 빈 catch 는 동작 변경 없이 마커 주석만 넣는다.
+            sb.Append($"catch ({t} {generatedExceptionName}) ");
+            sb.Append(replacementBody).Append(eol);
         }
+        // 정적 추론은 문서 미기재/암시적 연산/프로젝트 간 전파를 완전히 증명하지 못한다.
+        // 원본 broad catch 를 fallback 으로 남겨 미추론 예외의 런타임 동작을 보존한다.
+        sb.Append(originalCatch.ToString()).Append(eol);
         if (original.Finally != null)
         {
             sb.Append(original.Finally.ToString()); // finally 보존
@@ -94,14 +133,263 @@ internal partial class Program
             .Select(g => g.Key).ToList();
     }
 
-    private static void ProcessFixRoot(FixResult res, string file, SyntaxNode root, SemanticModel semanticModel, CSharpCompilation compilation, bool apply, Encoding enc, string eol)
+    private static void AtomicWriteAllText(string file, string text, Encoding enc)
+    {
+        var directory = Path.GetDirectoryName(Path.GetFullPath(file));
+        if (string.IsNullOrEmpty(directory))
+        {
+            File.WriteAllText(file, text, enc);
+            return;
+        }
+
+        var tempFile = Path.Combine(directory, "." + Path.GetFileName(file) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            File.WriteAllText(tempFile, text, enc);
+            if (File.Exists(file))
+            {
+                File.Replace(tempFile, file, null);
+            }
+            else
+            {
+                File.Move(tempFile, file);
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempFile)) File.Delete(tempFile);
+            }
+            catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    private static void AtomicWriteAllBytes(string file, byte[] bytes)
+    {
+        var directory = Path.GetDirectoryName(Path.GetFullPath(file));
+        if (string.IsNullOrEmpty(directory))
+        {
+            File.WriteAllBytes(file, bytes);
+            return;
+        }
+
+        var tempFile = Path.Combine(directory, "." + Path.GetFileName(file) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            File.WriteAllBytes(tempFile, bytes);
+            if (File.Exists(file))
+                File.Replace(tempFile, file, null);
+            else
+                File.Move(tempFile, file);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempFile)) File.Delete(tempFile);
+            }
+            catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    private static void ApplyPendingWrites(FixResult res)
+    {
+        if (res.PendingWrites.Count == 0) return;
+
+        var originals = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var write in res.PendingWrites)
+        {
+            if (File.Exists(write.File) && !originals.ContainsKey(write.File))
+                originals[write.File] = File.ReadAllBytes(write.File);
+        }
+
+        try
+        {
+            foreach (var write in res.PendingWrites)
+                AtomicWriteAllText(write.File, write.Text, write.Encoding);
+        }
+        catch (Exception ex)
+        {
+            res.CompileReverted += res.PendingWrites.Count;
+            res.ManualReview.Add($"batch apply rollback: {ex.GetType().Name} {ex.Message}");
+            foreach (var original in originals)
+            {
+                try { AtomicWriteAllBytes(original.Key, original.Value); }
+                catch (Exception restoreEx) { res.ManualReview.Add($"{original.Key} (rollback 실패: {restoreEx.GetType().Name} {restoreEx.Message})"); }
+            }
+        }
+    }
+
+    internal sealed class PendingWrite
+    {
+        public PendingWrite(string file, string text, Encoding encoding)
+        {
+            File = file;
+            Text = text;
+            Encoding = encoding;
+        }
+
+        public string File { get; }
+        public string Text { get; }
+        public Encoding Encoding { get; }
+    }
+
+    private static bool IsFrameworkNamespace(string? ns)
+    {
+        return ns == "System"
+            || ns?.StartsWith("System.", StringComparison.Ordinal) == true
+            || ns == "Microsoft"
+            || ns?.StartsWith("Microsoft.", StringComparison.Ordinal) == true;
+    }
+
+    private static string SymbolDisplay(ISymbol symbol)
+    {
+        return symbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat);
+    }
+
+    private static void AddUnsupportedExecutionCoverageWarnings(FixResult res, string file, int line, TryStatementSyntax tryStmt, SemanticModel semanticModel)
+    {
+        var nodes = tryStmt.Block.DescendantNodes(n => n is not AnonymousFunctionExpressionSyntax and not LocalFunctionStatementSyntax);
+
+        foreach (var assign in nodes.OfType<AssignmentExpressionSyntax>())
+        {
+            var leftSymbol = semanticModel.GetSymbolInfo(assign.Left).Symbol;
+            if (leftSymbol is IPropertySymbol or IEventSymbol)
+                res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: property/event assignment 예외 전파 미분석: {assign}");
+        }
+
+        foreach (var unary in nodes.OfType<PrefixUnaryExpressionSyntax>())
+        {
+            var symbol = semanticModel.GetSymbolInfo(unary).Symbol;
+            if (symbol is IMethodSymbol method && method.MethodKind == MethodKind.UserDefinedOperator)
+                res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: user-defined operator 예외 전파 미분석: {SymbolDisplay(method)}");
+        }
+
+        foreach (var unary in nodes.OfType<PostfixUnaryExpressionSyntax>())
+        {
+            var symbol = semanticModel.GetSymbolInfo(unary).Symbol;
+            if (symbol is IMethodSymbol method && method.MethodKind == MethodKind.UserDefinedOperator)
+                res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: user-defined operator 예외 전파 미분석: {SymbolDisplay(method)}");
+        }
+
+        foreach (var binary in nodes.OfType<BinaryExpressionSyntax>())
+        {
+            var symbol = semanticModel.GetSymbolInfo(binary).Symbol;
+            if (symbol is IMethodSymbol method && method.MethodKind == MethodKind.UserDefinedOperator)
+                res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: user-defined operator 예외 전파 미분석: {SymbolDisplay(method)}");
+        }
+
+        foreach (var cast in nodes.OfType<CastExpressionSyntax>())
+        {
+            var conversion = semanticModel.GetConversion(cast.Expression);
+            if (conversion.IsUserDefined)
+                res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: user-defined conversion 예외 전파 미분석: {cast}");
+        }
+
+        foreach (var awaitExpression in nodes.OfType<AwaitExpressionSyntax>())
+            res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: await 상태머신/awaiter 예외 전파 미분석: {awaitExpression}");
+
+        foreach (var foreachStatement in nodes.OfType<ForEachStatementSyntax>())
+            res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: foreach enumerator/Dispose 예외 전파 미분석: {foreachStatement.Expression}");
+
+        foreach (var usingStatement in nodes.OfType<UsingStatementSyntax>())
+            res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: using Dispose 예외 전파 미분석");
+
+        foreach (var query in nodes.OfType<QueryExpressionSyntax>())
+            res.AddCoverageWarning($"{file}:{line} — 미지원 실행 지점: query expression LINQ 호출 예외 전파 미분석: {query.FromClause.Identifier.ValueText}");
+    }
+
+    private static void CollectCoverageWarnings(FixResult res, string file, int line, TryStatementSyntax tryStmt, SemanticModel semanticModel, CSharpCompilation compilation, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts, IReadOnlyDictionary<string, MethodContext>? methodContexts)
+    {
+        AddUnsupportedExecutionCoverageWarnings(res, file, line, tryStmt, semanticModel);
+
+        var invocations = new List<InvocationExpressionSyntax>();
+        var creations = new List<BaseObjectCreationExpressionSyntax>();
+        var thrownExpressions = new List<ExpressionSyntax>();
+        var accessExpressions = new List<ExpressionSyntax>();
+        CollectThrowCapable(tryStmt.Block, invocations, creations, thrownExpressions, accessExpressions);
+
+        foreach (var call in invocations)
+        {
+            var symbolInfo = semanticModel.GetSymbolInfo(call);
+            var methodSymbol = symbolInfo.Symbol as IMethodSymbol
+                            ?? symbolInfo.CandidateSymbols.FirstOrDefault() as IMethodSymbol;
+            if (methodSymbol == null)
+            {
+                res.AddCoverageWarning($"{file}:{line} — 호출 심볼 해석 실패: {call}");
+                continue;
+            }
+
+            var ns = methodSymbol.ContainingNamespace?.ToDisplayString();
+            if (IsFrameworkNamespace(ns))
+            {
+                if (LookupDocumentedExceptions(methodSymbol) == null)
+                    res.AddCoverageWarning($"{file}:{line} — framework API 예외 문서 없음: {SymbolDisplay(methodSymbol)}");
+                continue;
+            }
+
+            var methodContext = ResolveMethodContext(methodSymbol, compilation, semanticModel, semanticContexts, methodContexts);
+            if (methodContext == null)
+            {
+                res.AddCoverageWarning($"{file}:{line} — 외부/라이브러리 호출 예외 전파 미분석: {SymbolDisplay(methodSymbol)}");
+                continue;
+            }
+        }
+
+        foreach (var creation in creations)
+        {
+            var ctorSymbol = semanticModel.GetSymbolInfo(creation).Symbol as IMethodSymbol;
+            if (ctorSymbol == null)
+            {
+                res.AddCoverageWarning($"{file}:{line} — 생성자 심볼 해석 실패: {creation}");
+                continue;
+            }
+
+            var ns = ctorSymbol.ContainingNamespace?.ToDisplayString();
+            if (IsFrameworkNamespace(ns))
+            {
+                if (LookupDocumentedExceptions(ctorSymbol) == null)
+                    res.AddCoverageWarning($"{file}:{line} — framework 생성자 예외 문서 없음: {SymbolDisplay(ctorSymbol)}");
+            }
+            else
+            {
+                res.AddCoverageWarning($"{file}:{line} — 사용자/외부 생성자 예외 전파 미분석: {SymbolDisplay(ctorSymbol)}");
+            }
+        }
+
+        foreach (var expr in thrownExpressions)
+        {
+            if (semanticModel.GetTypeInfo(expr).Type == null)
+                res.AddCoverageWarning($"{file}:{line} — 직접 throw 타입 해석 실패: {expr}");
+        }
+
+        foreach (var access in accessExpressions)
+        {
+            var propSymbol = semanticModel.GetSymbolInfo(access).Symbol as IPropertySymbol;
+            if (propSymbol == null) continue;
+
+            var ns = propSymbol.ContainingNamespace?.ToDisplayString();
+            if (IsFrameworkNamespace(ns) && LookupDocumentedExceptions(propSymbol) == null)
+                res.AddCoverageWarning($"{file}:{line} — framework 속성/인덱서 예외 문서 없음: {SymbolDisplay(propSymbol)}");
+            else if (!IsFrameworkNamespace(ns))
+                res.AddCoverageWarning($"{file}:{line} — 사용자/외부 속성/인덱서 예외 전파 미분석: {SymbolDisplay(propSymbol)}");
+        }
+    }
+
+    private static void ProcessFixRoot(FixResult res, string file, SyntaxNode root, SemanticModel semanticModel, CSharpCompilation compilation, bool apply, Encoding enc, string eol, IReadOnlyDictionary<SyntaxTree, SemanticContext>? semanticContexts = null, IReadOnlyDictionary<string, MethodContext>? methodContexts = null)
     {
         var tries = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
         if (tries.Count == 0) return;
 
+        var baselineErrors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+        if (baselineErrors.Count > 0)
+            res.AddCoverageWarning($"{file} — baseline compilation errors: {string.Join(", ", baselineErrors.Take(5).Select(d => d.Id))}");
+
         // FIX 3: 사전 빌드한 newTry 대신 (원본 try → 구체 타입/키) 매핑만 수집하고,
         // 실제 치환은 ReplaceNodes 콜백의 rewritten 인자로 만들어 자식 fix 를 보존한다.
         var typesFor = new Dictionary<TryStatementSyntax, List<string>>();
+        var catchFor = new Dictionary<TryStatementSyntax, CatchClauseSyntax>();
         var keyFor = new Dictionary<TryStatementSyntax, string>();
         var origFor = new Dictionary<string, (string beforeText, int line)>(); // key → (원본 미리보기, 줄)
         int idx = 0;
@@ -120,6 +408,13 @@ internal partial class Program
             }
 
             var theCatch = catches[0];
+            if (theCatch.Filter != null)
+            {
+                res.ManualReview.Add($"{file}:{line} (건너뜀: catch filter 보존 필요)");
+                res.Skipped_NonTrivial++;
+                continue;
+            }
+
             if (!IsOverBroadCatch(theCatch, semanticModel))
             {
                 res.Skipped_NotBroad++;
@@ -135,7 +430,8 @@ internal partial class Program
             }
 
             // 적격 대상: 구체 예외 추론
-            var exMap = AnalyzeTryBlock(tryStmt, semanticModel, compilation: compilation);
+            CollectCoverageWarnings(res, file, line, tryStmt, semanticModel, compilation, semanticContexts, methodContexts);
+            var exMap = AnalyzeTryBlock(tryStmt, semanticModel, compilation: compilation, semanticContexts: semanticContexts, methodContexts: methodContexts);
             var types = GetOrderedResolvedCatchTypes(compilation, exMap);
             if (types.Count == 0)
             {
@@ -147,8 +443,10 @@ internal partial class Program
 
             var key = (idx++).ToString();
             typesFor[tryStmt] = types;
+            catchFor[tryStmt] = theCatch;
             keyFor[tryStmt] = key;
             origFor[key] = (tryStmt.ToString(), line);
+            res.ManualReview.Add($"{file}:{line} (주의: 원본 broad catch fallback 보존 — 미추론 예외 escape 방지)");
         }
 
         if (typesFor.Count == 0) return;
@@ -156,7 +454,7 @@ internal partial class Program
         const string FixAnno = "AUTO-CATCH-FIX";
         var newRoot = root.ReplaceNodes(
             typesFor.Keys,
-            (orig, rewritten) => BuildReplacementTry((TryStatementSyntax)rewritten, typesFor[orig], eol)
+            (orig, rewritten) => BuildReplacementTry((TryStatementSyntax)rewritten, catchFor[orig], typesFor[orig], eol)
                 .WithTriviaFrom(orig)
                 .WithAdditionalAnnotations(Microsoft.CodeAnalysis.Formatting.Formatter.Annotation,
                                            new SyntaxAnnotation(FixAnno, keyFor[orig])));
@@ -200,7 +498,7 @@ internal partial class Program
 
         if (apply)
         {
-            File.WriteAllText(file, formattedText, enc);
+            res.PendingWrites.Add(new PendingWrite(file, formattedText, enc));
         }
     }
 
@@ -211,6 +509,8 @@ internal partial class Program
         // P1-11: 워크스페이스 로드 실패를 res 에 수집하려면 res 를 워크스페이스 생성 전에 선언해야 한다.
         using var workspace = OpenSolutionWorkspace(solutionPath, out var resolvedSolutionPath, msg => res.WorkspaceFailures.Add(msg));
         var solution = workspace.OpenSolutionAsync(resolvedSolutionPath).GetAwaiter().GetResult();
+        var semanticContexts = BuildSemanticContextMap(solution);
+        var methodContexts = BuildMethodContextMap(semanticContexts);
 
         Log($"🔧 솔루션 수정 시작: {resolvedSolutionPath}");
 
@@ -245,6 +545,7 @@ internal partial class Program
                 var full = Path.GetFullPath(file);
                 if (!processedFiles.Add(full))
                 {
+                    res.AddCoverageWarning($"{full} — linked/multi-context 파일: 최초 프로젝트 컨텍스트만 preview에 사용됨");
                     res.ManualReview.Add($"{full} (중복 프로젝트 컨텍스트 — 최초 1회만 수정)");
                     continue;
                 }
@@ -252,6 +553,7 @@ internal partial class Program
                 var root = document.GetSyntaxRootAsync().GetAwaiter().GetResult();
                 if (root == null)
                 {
+                    res.SkippedDocuments++;
                     res.ManualReview.Add($"{document.Name} (건너뜀: 구문 트리 없음)");
                     continue;
                 }
@@ -259,33 +561,24 @@ internal partial class Program
                 // FIX 4: 워크스페이스 root 를 구문 소스로 쓰되, 파일 바이트에서 (인코딩, EOL) 만 감지해 보존 되쓰기.
                 var (_, enc, eol) = ReadSourcePreserving(file);
                 var semanticModel = compilation.GetSemanticModel(root.SyntaxTree);
-                ProcessFixRoot(res, file, root, semanticModel, compilation, apply, enc, eol);
+                ProcessFixRoot(res, file, root, semanticModel, compilation, apply, enc, eol, semanticContexts, methodContexts);
             }
+        }
+
+        if (apply)
+        {
+            if (res.IsComplete) ApplyPendingWrites(res);
+            else res.ManualReview.Add($"{solutionPath} (적용 차단: scan 중 Completeness=PARTIAL)");
         }
 
         return res;
     }
 
-    public static FixResult RunFix(string target, bool apply, bool allowSourceOnlyFallback = false)
+    private static FixResult RunFixSourceOnly(string target, bool apply, bool allowPartialApplyForSelfTest = false)
     {
-        if (_apiDocCache.Count == 0)
-        {
-            LoadXmlDocumentation();
-        }
-
-        var solutionPath = TryResolveSingleSolutionPath(target);
-        if (solutionPath != null) return RunFixSolution(solutionPath, apply);
-        if (!allowSourceOnlyFallback)
-        {
-            // 분석 경로(ResolveSolutionPath)와 동일하게 명시적으로 실패시킨다 — 조용한 폴더 확대 금지.
-            // ResolveSolutionPath(target) 를 호출하면 0개/복수 .sln 에 맞는 한국어 예외 메시지가 던져진다.
-            ResolveSolutionPath(target); // always throws here (sln==1 case was handled above)
-            throw new InvalidOperationException($"솔루션을 확정할 수 없습니다: {target}"); // unreachable safety
-        }
-
-        // (이하 기존 폴더 모드 유지 — FIX 4 인코딩 보존 + FIX 5 제외 필터 적용)
         EnsureCodePagesRegistered();
         var res = new FixResult();
+        res.AddCoverageWarning($"{target} — source-only 모드: .sln/MSBuildWorkspace 없이 파일 단위 의미 분석을 수행하므로 결과는 PARTIAL");
 
         var references = BuildReferences(target);
         var csFiles = Directory.GetFiles(target, "*.cs", SearchOption.AllDirectories);
@@ -306,7 +599,44 @@ internal partial class Program
             ProcessFixRoot(res, file, root, semanticModel, compilation, apply, enc, eol);
         }
 
+        if (apply)
+        {
+            if (res.IsComplete || allowPartialApplyForSelfTest) ApplyPendingWrites(res);
+            else res.ManualReview.Add($"{target} (적용 차단: scan 중 Completeness=PARTIAL)");
+        }
+
         return res;
+    }
+
+    public static FixResult RunFix(string target, bool apply, bool allowSourceOnlyFallback = false)
+    {
+        if (_apiDocCache.Count == 0)
+        {
+            LoadXmlDocumentation();
+        }
+
+        if (apply)
+        {
+            var preview = RunFix(target, apply: false, allowSourceOnlyFallback);
+            if (!preview.IsComplete)
+            {
+                preview.ManualReview.Add($"{target} (적용 차단: Completeness=PARTIAL)");
+                return preview;
+            }
+        }
+
+        var solutionPath = TryResolveSingleSolutionPath(target);
+        if (solutionPath != null) return RunFixSolution(solutionPath, apply);
+        if (!allowSourceOnlyFallback)
+        {
+            // 분석 경로(ResolveSolutionPath)와 동일하게 명시적으로 실패시킨다 — 조용한 폴더 확대 금지.
+            // ResolveSolutionPath(target) 를 호출하면 0개/복수 .sln 에 맞는 한국어 예외 메시지가 던져진다.
+            ResolveSolutionPath(target); // always throws here (sln==1 case was handled above)
+            throw new InvalidOperationException($"솔루션을 확정할 수 없습니다: {target}"); // unreachable safety
+        }
+
+        // (이하 기존 폴더 모드 유지 — FIX 4 인코딩 보존 + FIX 5 제외 필터 적용)
+        return RunFixSourceOnly(target, apply);
     }
 
     public static void WriteFixReport(FixResult res, bool apply)
@@ -319,12 +649,19 @@ internal partial class Program
         sb.AppendLine($"Skipped_NotBroad    : {res.Skipped_NotBroad}");
         sb.AppendLine($"CompileReverted     : {res.CompileReverted}");
         sb.AppendLine($"SkippedDocuments    : {res.SkippedDocuments}");
+        sb.AppendLine($"CoverageWarnings    : {res.CoverageWarnings.Count}");
         sb.AppendLine($"Completeness       : {(res.IsComplete ? "Complete" : "PARTIAL")}");
         sb.AppendLine();
         if (res.WorkspaceFailures.Count > 0)
         {
             sb.AppendLine("----- WORKSPACE FAILURES -----");
             foreach (var wf in res.WorkspaceFailures) sb.AppendLine(wf);
+            sb.AppendLine();
+        }
+        if (res.CoverageWarnings.Count > 0)
+        {
+            sb.AppendLine("----- COVERAGE WARNINGS -----");
+            foreach (var cw in res.CoverageWarnings) sb.AppendLine(cw);
             sb.AppendLine();
         }
         sb.AppendLine("----- PREVIEW BLOCKS -----");

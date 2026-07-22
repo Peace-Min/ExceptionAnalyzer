@@ -207,8 +207,8 @@ internal partial class Program
                 "using System;\n" +
                 "class Broad\n{\n    void M(string s)\n    {\n" +
                 "        try { int n = int.Parse(s); }\n" +
-                "        catch (Exception ex) { LogUtil.Error(ex); }\n" +
-                "    }\n}\n");
+                "        catch (Exception ex) { Log(ex); }\n" +
+                "    }\n    void Log(Exception e) { }\n}\n");
 
             // 과도-넓음 + 빈 본문 → 적격
             File.WriteAllText(emptyPath,
@@ -243,7 +243,7 @@ internal partial class Program
             L($"[preview] 디스크 미변경: {(previewUnchanged ? "PASS" : "FAIL")} (Modified 미리보기={previewRes.Modified})");
 
             // 3. apply
-            var res = RunFix(fixtureDir, true, allowSourceOnlyFallback: true);
+            var res = RunFixSourceOnly(fixtureDir, true, allowPartialApplyForSelfTest: true);
 
             var broadText = File.ReadAllText(broadPath);
             var emptyText = File.ReadAllText(emptyPath);
@@ -252,13 +252,14 @@ internal partial class Program
 
             bool bareCatch(string t) => System.Text.RegularExpressions.Regex.IsMatch(t, @"catch\s*\{");
 
-            // [1] Broad: 구체 3종 + Debug.WriteLine, Exception/bare 없음
-            bool t1 = broadText.Contains("catch (System.ArgumentNullException ex)")
-                   && broadText.Contains("catch (System.FormatException ex)")
-                   && broadText.Contains("catch (System.OverflowException ex)")
-                   && broadText.Contains("System.Diagnostics.Debug.WriteLine(ex)")
-                   && !broadText.Contains("catch (System.Exception")
-                   && !broadText.Contains("catch (Exception")
+            // [1] Broad: 구체 3종 + 기존 단일 호출 본문 보존 + broad fallback 보존
+            bool t1 = broadText.Contains("catch (System.ArgumentNullException __autoCatchEx)")
+                   && broadText.Contains("catch (System.FormatException __autoCatchEx)")
+                   && broadText.Contains("catch (System.OverflowException __autoCatchEx)")
+                   && broadText.Contains("Exception ex = __autoCatchEx;")
+                   && broadText.Contains("Log(ex)")
+                   && !broadText.Contains("System.Diagnostics.Debug.WriteLine(ex)")
+                   && broadText.Contains("catch (Exception ex)")
                    && !bareCatch(broadText);
 
             // [2] Broad.cs 컴파일 (CS0160 없음)
@@ -277,11 +278,11 @@ internal partial class Program
             // [5] Broad 에 using System.Diagnostics; 추가 안 됨
             bool t5 = !broadText.Contains("using System.Diagnostics;");
 
-            // [6] Empty 변경 → 구체 catch + Debug.WriteLine
+            // [6] Empty 변경 → 구체 catch + 빈 catch fallback 보존
             bool t6 = emptyText != before[emptyPath]
-                   && emptyText.Contains("System.Diagnostics.Debug.WriteLine(ex)")
+                   && emptyText.Contains("[AUTO-CATCH] 원본 빈 catch")
                    && emptyText.Contains("catch (System.FormatException ex)")
-                   && !bareCatch(emptyText);
+                   && bareCatch(emptyText);
 
             L("===== SELFTEST-FIX 결과 =====");
             L($"FixResult: Modified={res.Modified}, Skipped_NonTrivial={res.Skipped_NonTrivial}, Skipped_Empty={res.Skipped_Empty}, Skipped_NotBroad={res.Skipped_NotBroad}, CompileReverted={res.CompileReverted}");
@@ -292,12 +293,12 @@ internal partial class Program
             L("--- Empty.cs (after) ---");
             L(emptyText);
             L("=============================");
-            L($"[1] Broad → 구체 3종 + Debug.WriteLine, Exception/bare 제거: {(t1 ? "PASS" : "FAIL")}");
+            L($"[1] Broad → 구체 3종 + 기존 Log 본문 + broad fallback 보존: {(t1 ? "PASS" : "FAIL")}");
             L($"[2] Broad.cs 컴파일(CS0160 없음): {(t2 ? "PASS" : "FAIL")}");
             L($"[3] NonTrivial 미변경 + ManualReview: {(t3 ? "PASS" : "FAIL")}");
             L($"[4] Specific 미변경 (Skipped_NotBroad): {(t4 ? "PASS" : "FAIL")}");
             L($"[5] Broad 에 using System.Diagnostics; 미추가: {(t5 ? "PASS" : "FAIL")}");
-            L($"[6] Empty 변경 → 구체 catch + Debug.WriteLine: {(t6 ? "PASS" : "FAIL")}");
+            L($"[6] Empty 변경 → 구체 catch + 빈 catch fallback 보존: {(t6 ? "PASS" : "FAIL")}");
 
             // ── [7] nested-try : 부모/자식 broad 모두 치환, Modified==2, 재컴파일 CS0160 없음 ──
             var nestedDir = Path.Combine(fixtureDir, "nested");
@@ -314,15 +315,15 @@ internal partial class Program
                 "    }\n" +
                 "    void Log(Exception e) { }\n" +
                 "}\n");
-            var nestedRes = RunFix(nestedDir, true, allowSourceOnlyFallback: true);
+            var nestedRes = RunFixSourceOnly(nestedDir, true, allowPartialApplyForSelfTest: true);
             var nestedText = File.ReadAllText(nestedPath);
-            int autoCatchCount = System.Text.RegularExpressions.Regex.Matches(nestedText, @"\[AUTO-CATCH\]").Count;
-            bool nestedNoBroad = !nestedText.Contains("catch (Exception ");
+            int preservedLogCount = System.Text.RegularExpressions.Regex.Matches(nestedText, @"Log\(ex\)").Count;
+            bool nestedBroadFallback = nestedText.Contains("catch (Exception ");
             var nestedTree = CSharpSyntaxTree.ParseText(nestedText);
             var nestedComp = CSharpCompilation.Create("NestedCheck").AddReferences(BuildReferences(nestedDir)).AddSyntaxTrees(nestedTree);
             bool nestedNoCs0160 = !nestedComp.GetDiagnostics().Any(d => d.Id == "CS0160");
-            bool t7 = nestedNoBroad && autoCatchCount >= 2 && nestedRes.Modified == 2 && nestedNoCs0160;
-            L($"[7] nested-try: {(t7 ? "PASS" : "FAIL")} (Modified={nestedRes.Modified}, autoCatch={autoCatchCount}, noBroad={nestedNoBroad}, noCS0160={nestedNoCs0160})");
+            bool t7 = nestedBroadFallback && preservedLogCount >= 2 && nestedRes.Modified == 2 && nestedNoCs0160;
+            L($"[7] nested-try: {(t7 ? "PASS" : "FAIL")} (Modified={nestedRes.Modified}, preservedLog={preservedLogCount}, broadFallback={nestedBroadFallback}, noCS0160={nestedNoCs0160})");
 
             // ── [8] cross-project guard (in-memory, no MSBuild) : 외부 트리 심볼로 AnalyzeTryBlock 이 예외 없이 통과 ──
             var xNet472 = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\";
@@ -343,11 +344,20 @@ internal partial class Program
                 .AddReferences(refsA)
                 .AddSyntaxTrees(treeA);
             var modelA = compA.GetSemanticModel(treeA);
+            var sourceSemanticContexts = new Dictionary<SyntaxTree, SemanticContext>
+            {
+                [treeB] = new SemanticContext(compB, compB.GetSemanticModel(treeB))
+            };
+            var sourceMethodContexts = BuildMethodContextMap(sourceSemanticContexts);
             var tryStmtA = treeA.GetRoot().DescendantNodes().OfType<TryStatementSyntax>().First();
             bool t8;
-            try { AnalyzeTryBlock(tryStmtA, modelA, compilation: compA); t8 = true; }
+            try
+            {
+                var crossMap = AnalyzeTryBlock(tryStmtA, modelA, compilation: compA, semanticContexts: sourceSemanticContexts, methodContexts: sourceMethodContexts);
+                t8 = crossMap.ContainsKey("System.FormatException") || crossMap.ContainsKey("System.OverflowException");
+            }
             catch (Exception ex) { t8 = false; L("  [8] 예외 발생: " + ex.GetType().Name + " — " + ex.Message); }
-            L($"[8] cross-project guard (예외 없음): {(t8 ? "PASS" : "FAIL")}");
+            L($"[8] cross-project propagation: {(t8 ? "PASS" : "FAIL")}");
 
             // ── [9] encoding preservation : BOM+CRLF / no-BOM / CP949 보존 ──
             EnsureCodePagesRegistered();
@@ -368,7 +378,7 @@ internal partial class Program
             var cp949 = Encoding.GetEncoding(949);
             File.WriteAllText(cp949Path, EligibleSrc("C_c", "// 한글주석확인\n"), cp949);
 
-            var encRes = RunFix(encDir, true, allowSourceOnlyFallback: true);
+            var encRes = RunFixSourceOnly(encDir, true, allowPartialApplyForSelfTest: true);
 
             var bomBytes = File.ReadAllBytes(bomPath);
             bool bomKept = bomBytes.Length >= 3 && bomBytes[0] == 0xEF && bomBytes[1] == 0xBB && bomBytes[2] == 0xBF;
@@ -397,7 +407,7 @@ internal partial class Program
                 "    void B() { int    weird=1 ; }\n" +
                 "    void Log(Exception e) { }\n" +
                 "}\n");
-            var fmtRes = RunFix(fmtDir, true, allowSourceOnlyFallback: true);
+            var fmtRes = RunFixSourceOnly(fmtDir, true, allowPartialApplyForSelfTest: true);
             var fmtText = File.ReadAllText(fmtPath);
             bool weirdKept = fmtText.Contains("int    weird=1 ;");
             bool t10 = weirdKept && fmtRes.Modified == 1;
@@ -426,7 +436,7 @@ internal partial class Program
             File.WriteAllText(genPath,
                 "using System;\nclass Gen { void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }\n");
             var genBefore = File.ReadAllBytes(genPath);
-            var exRes = RunFix(exDir, true, allowSourceOnlyFallback: true);
+            var exRes = RunFixSourceOnly(exDir, true, allowPartialApplyForSelfTest: true);
             var genAfter = File.ReadAllBytes(genPath);
             bool bytesEqual = genBefore.SequenceEqual(genAfter);
             bool t12 = bytesEqual && exRes.Modified == 0;
@@ -444,13 +454,13 @@ internal partial class Program
                 "    }\n" +
                 "    void Log(Exception e) { }\n" +
                 "}\n");
-            var ctorRes = RunFix(ctorDir, true, allowSourceOnlyFallback: true);
+            var ctorRes = RunFixSourceOnly(ctorDir, true, allowPartialApplyForSelfTest: true);
             var ctorText = File.ReadAllText(ctorPath);
             bool ctorHasIoException =
                    ctorText.Contains("catch (System.UnauthorizedAccessException")
                 || ctorText.Contains("catch (System.IO.IOException")
                 || ctorText.Contains("catch (System.IO.DirectoryNotFoundException");
-            bool t13 = ctorRes.Modified >= 1 && ctorHasIoException && !ctorText.Contains("catch (Exception ");
+            bool t13 = ctorRes.Modified >= 1 && ctorHasIoException && ctorText.Contains("catch (Exception ");
             L("--- Ctor.cs (after) ---");
             L(ctorText);
             L($"[13] 생성자 예외 수집: {(t13 ? "PASS" : "FAIL")} (Modified={ctorRes.Modified}, ioCatch={ctorHasIoException})");
@@ -467,7 +477,7 @@ internal partial class Program
                 "    }\n" +
                 "    void Log(Exception e) { }\n" +
                 "}\n");
-            var throwRes = RunFix(throwDir, true, allowSourceOnlyFallback: true);
+            var throwRes = RunFixSourceOnly(throwDir, true, allowPartialApplyForSelfTest: true);
             var throwText = File.ReadAllText(throwPath);
             bool t14 = throwRes.Modified >= 1 && throwText.Contains("catch (System.InvalidOperationException");
             L($"[14] 직접 throw 수집: {(t14 ? "PASS" : "FAIL")} (Modified={throwRes.Modified})");
@@ -485,13 +495,13 @@ internal partial class Program
                 "    void Log(Exception e) { }\n" +
                 "}\n");
             var lambdaBefore = File.ReadAllText(lambdaPath);
-            var lambdaRes = RunFix(lambdaDir, true, allowSourceOnlyFallback: true);
+            var lambdaRes = RunFixSourceOnly(lambdaDir, true, allowPartialApplyForSelfTest: true);
             var lambdaText = File.ReadAllText(lambdaPath);
             bool lambdaUnchanged = lambdaText == lambdaBefore;
             bool t15 = !lambdaText.Contains("FormatException") && lambdaUnchanged;
             L($"[15] 람다 경계: {(t15 ? "PASS" : "FAIL")} (unchanged={lambdaUnchanged}, Skipped_Empty={lambdaRes.Skipped_Empty})");
 
-            // ── [16] 중첩 try 보호블록 경계 : 외부는 내부 보호블록의 int.Parse 예외를 상속하지 않음 ──
+            // ── [16] 중첩 try 보호블록 경계 : 내부 catch가 일부 예외만 잡을 수 있으므로 외부 broad catch는 보존 ──
             var nestGuardDir = Path.Combine(fixtureDir, "nestguard");
             Directory.CreateDirectory(nestGuardDir);
             var nestGuardPath = Path.Combine(nestGuardDir, "NestGuard.cs");
@@ -504,11 +514,11 @@ internal partial class Program
                 "    void Log(Exception e) { }\n" +
                 "}\n");
             var nestGuardBefore = File.ReadAllText(nestGuardPath);
-            var nestGuardRes = RunFix(nestGuardDir, true, allowSourceOnlyFallback: true);
+            var nestGuardRes = RunFixSourceOnly(nestGuardDir, true, allowPartialApplyForSelfTest: true);
             var nestGuardText = File.ReadAllText(nestGuardPath);
             int outerBroadCount = System.Text.RegularExpressions.Regex.Matches(nestGuardText, @"catch \(Exception ex\)").Count;
-            bool t16 = outerBroadCount == 1 && !nestGuardText.Contains("OverflowException") && nestGuardText == nestGuardBefore;
-            L($"[16] 중첩 try 보호블록 경계: {(t16 ? "PASS" : "FAIL")} (broadCount={outerBroadCount}, noOverflow={!nestGuardText.Contains("OverflowException")}, unchanged={nestGuardText == nestGuardBefore})");
+            bool t16 = outerBroadCount == 1 && nestGuardText.Contains("OverflowException") && nestGuardText != nestGuardBefore;
+            L($"[16] 중첩 try 미처리 예외 전파: {(t16 ? "PASS" : "FAIL")} (broadCount={outerBroadCount}, hasOverflow={nestGuardText.Contains("OverflowException")}, changed={nestGuardText != nestGuardBefore})");
 
             // ── [17] 진단 지문 : 같은 CS0029 오류가 1→2 개로 늘면 신규 오류로 검출 (구 ID-set 로직은 미검출) ──
             var fpNet472 = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\";
@@ -528,9 +538,72 @@ internal partial class Program
             bool t17 = fpIntroduced.Count > 0 && fpSame.Count == 0;
             L($"[17] 진단 지문: {(t17 ? "PASS" : "FAIL")} (introduced={fpIntroduced.Count}, sameSame={fpSame.Count})");
 
+            // ── [18] catch filter 보존 : catch(Exception) when (...) 은 자동수정하지 않고 수동검토로 넘김 ──
+            var filterDir = Path.Combine(fixtureDir, "filter");
+            Directory.CreateDirectory(filterDir);
+            var filterPath = Path.Combine(filterDir, "Filter.cs");
+            File.WriteAllText(filterPath,
+                "using System;\n" +
+                "class Cf {\n" +
+                "    void M(string s) {\n" +
+                "        try { int n = int.Parse(s); } catch (Exception ex) when (ex.Message.Length > 0) { Log(ex); }\n" +
+                "    }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var filterBefore = File.ReadAllText(filterPath);
+            var filterRes = RunFixSourceOnly(filterDir, true, allowPartialApplyForSelfTest: true);
+            var filterText = File.ReadAllText(filterPath);
+            bool t18 = filterText == filterBefore
+                    && filterRes.Modified == 0
+                    && filterRes.Skipped_NonTrivial >= 1
+                    && filterRes.ManualReview.Any(m => m.Contains("catch filter"));
+            L($"[18] catch filter 보존/스킵: {(t18 ? "PASS" : "FAIL")} (Modified={filterRes.Modified}, NonTrivial={filterRes.Skipped_NonTrivial})");
+
+            // ── [19] coverage completeness : source-only 모드는 결과를 Complete 로 보고하지 않음 ──
+            bool t19 = !res.IsComplete
+                    && res.CoverageWarnings.Any(m => m.Contains("source-only"));
+            L($"[19] coverage completeness: {(t19 ? "PASS" : "FAIL")} (sourceOnlyPartial={!res.IsComplete}, warnings={res.CoverageWarnings.Count})");
+
+            // ── [20] public API apply gate : PARTIAL(source-only) 은 직접 RunFix apply 도 쓰기 금지 ──
+            var publicGateDir = Path.Combine(fixtureDir, "publicgate");
+            Directory.CreateDirectory(publicGateDir);
+            var publicGatePath = Path.Combine(publicGateDir, "Gate.cs");
+            File.WriteAllText(publicGatePath,
+                "using System;\nclass Pg { void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }\n");
+            var publicGateBefore = File.ReadAllText(publicGatePath);
+            var publicGateRes = RunFix(publicGateDir, true, allowSourceOnlyFallback: true);
+            var publicGateAfter = File.ReadAllText(publicGatePath);
+            bool t20 = publicGateAfter == publicGateBefore
+                    && publicGateRes.Modified > 0
+                    && !publicGateRes.IsComplete
+                    && publicGateRes.ManualReview.Any(m => m.Contains("적용 차단"));
+            L($"[20] public API PARTIAL apply gate: {(t20 ? "PASS" : "FAIL")} (unchanged={publicGateAfter == publicGateBefore}, ModifiedPreview={publicGateRes.Modified}, Complete={publicGateRes.IsComplete})");
+
+            // ── [21] unsupported execution coverage : operator/foreach/using 같은 미지원 실행 지점은 Complete 금지 ──
+            var unsupportedDir = Path.Combine(fixtureDir, "unsupported");
+            Directory.CreateDirectory(unsupportedDir);
+            var unsupportedPath = Path.Combine(unsupportedDir, "Unsupported.cs");
+            File.WriteAllText(unsupportedPath,
+                "using System;\nusing System.Collections.Generic;\n" +
+                "struct Risky { public static Risky operator +(Risky a, Risky b) => throw new InvalidOperationException(); }\n" +
+                "class U {\n" +
+                "  void M(IEnumerable<int> xs, IDisposable d) {\n" +
+                "    try { var r = new Risky() + new Risky(); foreach (var x in xs) { } using (d) { } }\n" +
+                "    catch (Exception ex) { Log(ex); }\n" +
+                "  }\n" +
+                "  void Log(Exception e) { }\n" +
+                "}\n");
+            var unsupportedBefore = File.ReadAllText(unsupportedPath);
+            var unsupportedRes = RunFix(unsupportedDir, true, allowSourceOnlyFallback: true);
+            var unsupportedAfter = File.ReadAllText(unsupportedPath);
+            bool t21 = unsupportedAfter == unsupportedBefore
+                    && !unsupportedRes.IsComplete
+                    && unsupportedRes.CoverageWarnings.Any(m => m.Contains("미지원 실행 지점"));
+            L($"[21] unsupported execution coverage: {(t21 ? "PASS" : "FAIL")} (unchanged={unsupportedAfter == unsupportedBefore}, warnings={unsupportedRes.CoverageWarnings.Count})");
+
             allPass = previewUnchanged && t1 && t2 && t3 && t4 && t5 && t6
                    && t7 && t8 && t9 && t10 && t11 && t12
-                   && t13 && t14 && t15 && t16 && t17;
+                   && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21;
             L(allPass ? "SELFTEST-FIX PASS" : "SELFTEST-FIX FAIL");
         }
         catch (Exception ex)
