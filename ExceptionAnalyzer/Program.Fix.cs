@@ -83,17 +83,24 @@ internal partial class Program
     private static TryStatementSyntax BuildReplacementTry(TryStatementSyntax original, CatchClauseSyntax originalCatch, List<string> fullTypeNames, string eol)
     {
         var originalExceptionName = originalCatch.Declaration?.Identifier.ValueText;
-        var generatedExceptionName = string.IsNullOrWhiteSpace(originalExceptionName) ? "ex" : "__autoCatchEx";
+        // FIX 1(CS0168/CS0219): 원본이 예외 변수명을 가졌고(hasVar) 본문이 비어있지 않을 때만 식별자/별칭을 생성한다.
+        //  - hasVar && bodyNonEmpty  → catch (T __autoCatchEx) { Exception <name> = __autoCatchEx; <body> } (본문이 예외 변수 참조 가능 → 별칭으로 오버로드 바인딩 보존)
+        //  - 그 외(원본 변수 없음 또는 빈 본문) → catch (T) { <body|marker> } : 식별자·별칭 없음(미사용 변수 경고 유발 방지).
+        //    (본문은 정의상 예외 변수를 참조하지 않는다 — 비어있거나, 원본에 변수명이 없어 참조 불가.)
+        bool hasVar = originalCatch.Declaration != null && !string.IsNullOrWhiteSpace(originalExceptionName);
+        bool bodyNonEmpty = originalCatch.Block.Statements.Count > 0;
+        bool emitIdentifier = hasVar && bodyNonEmpty;
+        const string generatedExceptionName = "__autoCatchEx";
 
         string ReplacementBody()
         {
-            if (originalCatch.Block.Statements.Count == 0)
+            if (!bodyNonEmpty)
                 return "{ /* [AUTO-CATCH] 원본 빈 catch */ }";
 
-            if (originalCatch.Declaration == null || string.IsNullOrWhiteSpace(originalExceptionName))
+            if (!hasVar)
                 return originalCatch.Block.ToString();
 
-            var originalTypeText = originalCatch.Declaration.Type.ToString();
+            var originalTypeText = originalCatch.Declaration!.Type.ToString();
             var bodyText = originalCatch.Block.ToString();
             var open = bodyText.IndexOf('{');
             var close = bodyText.LastIndexOf('}');
@@ -116,7 +123,8 @@ internal partial class Program
         foreach (var t in fullTypeNames)
         {
             // 완전수식 타입 + 기존 안전 catch 본문 보존. 빈 catch 는 동작 변경 없이 마커 주석만 넣는다.
-            sb.Append($"catch ({t} {generatedExceptionName}) ");
+            // 식별자는 별칭이 참조하는 경우(emitIdentifier)에만 붙인다 → 미사용 catch 변수(CS0168/CS0219) 방지.
+            sb.Append(emitIdentifier ? $"catch ({t} {generatedExceptionName}) " : $"catch ({t}) ");
             sb.Append(replacementBody).Append(eol);
         }
         // 정적 추론은 문서 미기재/암시적 연산/프로젝트 간 전파를 완전히 증명하지 못한다.
@@ -631,7 +639,8 @@ internal partial class Program
         return res;
     }
 
-    private static FixResult RunFixSourceOnly(string target, bool apply, bool allowPartialApplyForSelfTest = false)
+    // internal: selftest/xunit 테스트 시임(테스트에서 apply 우회로 직접 호출). 프로덕션 apply 의미는 불변.
+    internal static FixResult RunFixSourceOnly(string target, bool apply, bool allowPartialApplyForSelfTest = false)
     {
         EnsureCodePagesRegistered();
         var res = new FixResult();
@@ -695,8 +704,11 @@ internal partial class Program
     {
         var sb = new StringBuilder();
         sb.AppendLine($"===== EXCEPTION FIX REPORT MODE={(apply ? "APPLY" : "PREVIEW")} =====");
+        // FIX 3: source-only(진단 전용) 은 파일을 쓰지 않는다 → Modified 가 '예상(미적용)' 수치임을 상단에 명시.
+        if (res.SourceOnlyDiagnostic)
+            sb.AppendLine("*** DIAGNOSTIC-ONLY (--source-only): 파일을 쓰지 않습니다. Modified는 예상(미적용) 수치입니다. ***");
         // Modified = '적용 대상(클린 파일)'의 치환 catch 수. baseline 오류 파일은 SkippedIntegrityFiles 로 분리 집계.
-        sb.AppendLine($"Modified(적용대상=클린) : {res.Modified}");
+        sb.AppendLine($"Modified(적용대상=클린){(res.SourceOnlyDiagnostic ? "[예상=미적용]" : "")} : {res.Modified}");
         sb.AppendLine($"SkippedIntegrityFiles : {res.SkippedIntegrityFiles}");
         sb.AppendLine($"Skipped_NonTrivial  : {res.Skipped_NonTrivial}");
         sb.AppendLine($"Skipped_Empty       : {res.Skipped_Empty}");
@@ -708,9 +720,14 @@ internal partial class Program
         sb.AppendLine($"ApplyFailed         : {res.ApplyFailed}");
         if (apply)
             sb.AppendLine($"AppliedFiles       : {res.AppliedFileCount}");
-        var completeness = res.IsComplete
-            ? (res.HasCoverageGaps ? $"Complete (커버리지 참고 {res.CoverageWarnings.Count}건 — 비차단)" : "Complete")
-            : "PARTIAL";
+        // FIX 2: 저장 실패(apply && ApplyFailed) 는 Complete/PARTIAL 로 오보하지 않고 FAILED 로 표기.
+        string completeness;
+        if (apply && res.ApplyFailed)
+            completeness = "FAILED (저장 실패 — 롤백 시도됨)";
+        else if (res.IsComplete)
+            completeness = res.HasCoverageGaps ? $"Complete (커버리지 참고 {res.CoverageWarnings.Count}건 — 비차단)" : "Complete";
+        else
+            completeness = "PARTIAL";
         sb.AppendLine($"Completeness       : {completeness}");
         sb.AppendLine();
         if (res.WorkspaceFailures.Count > 0)
@@ -721,7 +738,8 @@ internal partial class Program
         }
         if (res.IntegrityFailures.Count > 0)
         {
-            sb.AppendLine("----- INTEGRITY FAILURES (차단) -----");
+            // FIX 3: 더 이상 전역 차단이 아니라 '해당 파일만 스킵'(per-file 게이팅) → 라벨을 정직하게 반영.
+            sb.AppendLine($"----- INTEGRITY NOTES (해당 파일만 스킵 — 클린 파일은 적용됨) (SkippedIntegrityFiles={res.SkippedIntegrityFiles}) -----");
             foreach (var f in res.IntegrityFailures) sb.AppendLine(f);
             sb.AppendLine();
         }

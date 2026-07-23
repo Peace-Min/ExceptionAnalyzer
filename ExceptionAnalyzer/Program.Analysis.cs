@@ -258,7 +258,9 @@ internal partial class Program
     }
 
     // 분석 진입점: 하드코딩 경로 대신 인자로 받은 폴더를 분석한다. 백그라운드 스레드에서 반복 호출해도 안전.
-    public static void AnalyzeDirectory(string targetDirectory)
+    // FIX 4: --fix 와 동일하게 부분 로드(워크스페이스 실패/건너뛴 문서)를 완전성으로 신호한다.
+    //   반환값 true=완전, false=부분(일부 프로젝트/문서 로드 실패) → 호출측이 exit code(0/2)로 매핑.
+    public static bool AnalyzeDirectory(string targetDirectory)
     {
         // 반복 호출 안전: 파일별 예외 목록 상태 초기화
         methodExceptionList = new Dictionary<string, string>();
@@ -272,7 +274,10 @@ internal partial class Program
             Log($"✅ {_apiDocCache.Count}개의 API 문서 로드 완료");
         }
 
-        using var workspace = OpenSolutionWorkspace(targetDirectory, out var solutionPath);
+        // FIX 4: 완전성 집계 — 워크스페이스 로드 실패(RunFixSolution 과 동일한 onFailure 콜백)와 건너뛴 문서 수.
+        int workspaceFailures = 0;
+        int skippedDocuments = 0;
+        using var workspace = OpenSolutionWorkspace(targetDirectory, out var solutionPath, _ => workspaceFailures++);
         var solution = workspace.OpenSolutionAsync(solutionPath).GetAwaiter().GetResult();
         var semanticContexts = BuildSemanticContextMap(solution);
         var methodContexts = BuildMethodContextMap(semanticContexts);
@@ -294,18 +299,29 @@ internal partial class Program
             if (compilation == null)
             {
                 ReportSkipped(writer, $"프로젝트 컴파일을 만들 수 없음: {project.Name}");
+                skippedDocuments += project.Documents.Count(); // FIX 4: RunFixSolution 과 동일하게 문서 전체를 건너뜀으로 집계
                 continue;
             }
 
             foreach (var document in project.Documents)
             {
+                // FIX 4: RunFixSolution 과 동일하게 파일 경로 없음/부재 문서를 건너뜀으로 집계(완전성 판정).
+                var docFile = document.FilePath;
+                if (string.IsNullOrWhiteSpace(docFile) || !File.Exists(docFile))
+                {
+                    skippedDocuments++;
+                    ReportSkipped(writer, $"{document.Name} (건너뜀: 파일 경로 없음)");
+                    continue;
+                }
+
                 // FIX 5: obj/bin/.git·생성 파일 제외 (분석 일관성 유지)
-                if (document.FilePath != null && IsExcludedSourcePath(document.FilePath)) continue;
+                if (IsExcludedSourcePath(docFile)) continue;
 
                 var root = document.GetSyntaxRootAsync().GetAwaiter().GetResult();
                 if (root == null)
                 {
-                    ReportSkipped(writer, $"문서 구문 트리를 읽을 수 없음: {document.FilePath ?? document.Name}");
+                    skippedDocuments++;
+                    ReportSkipped(writer, $"문서 구문 트리를 읽을 수 없음: {docFile}");
                     continue;
                 }
 
@@ -313,7 +329,7 @@ internal partial class Program
                 if (!tryStatements.Any()) continue;
 
                 var semanticModel = compilation.GetSemanticModel(root.SyntaxTree);
-                var file = document.FilePath ?? document.Name;
+                var file = docFile;
                 foreach (var tryStmt in tryStatements)
                 {
                     var line = tryStmt.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
@@ -342,6 +358,12 @@ internal partial class Program
         writer.Flush();
         exceptionWriter.Flush();
         Log("📄 결과 저장 완료: " + outputPath);
+
+        // FIX 4: 워크스페이스 로드 실패나 건너뛴 문서가 없으면 완전(true), 있으면 부분(false).
+        bool complete = workspaceFailures == 0 && skippedDocuments == 0;
+        if (!complete)
+            Log($"⚠️ 분석 부분 완료: 워크스페이스 실패 {workspaceFailures}건, 건너뛴 문서 {skippedDocuments}건");
+        return complete;
     }
 
     // exMap 에 집계, writer/exceptionWriter 는 nullable — null 이면 파일/로그 출력 없이 순수 집계만 수행(RunFix 재사용).

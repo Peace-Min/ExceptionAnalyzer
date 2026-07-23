@@ -279,9 +279,12 @@ internal partial class Program
             bool t5 = !broadText.Contains("using System.Diagnostics;");
 
             // [6] Empty 변경 → 구체 catch + 빈 catch fallback 보존
+            //   FIX 1: 원본이 bare catch{}(변수 없음·빈 본문) → 생성 catch 는 식별자 없이 `catch (System.FormatException)`
+            //          (미사용 예외변수 CS0168 방지). 기대 부분문자열을 식별자 없는 형태로 갱신.
             bool t6 = emptyText != before[emptyPath]
                    && emptyText.Contains("[AUTO-CATCH] 원본 빈 catch")
-                   && emptyText.Contains("catch (System.FormatException ex)")
+                   && emptyText.Contains("catch (System.FormatException)")
+                   && !emptyText.Contains("catch (System.FormatException __autoCatchEx)")
                    && bareCatch(emptyText);
 
             L("===== SELFTEST-FIX 결과 =====");
@@ -673,10 +676,105 @@ internal partial class Program
             L(cleanAfterText);
             L($"[25] 파일별 best-effort 게이팅: {(t25 ? "PASS" : "FAIL")} (cleanApplied={cleanApplied}, dirtyUnchanged={dirtyUnchanged}, SkippedIntegrity={gatingRes.SkippedIntegrityFiles}, Modified={gatingRes.Modified})");
 
+            // ── [26] FIX 1: 생성 catch 가 미사용 예외변수 경고(CS0168/CS0219)를 유발하지 않음 ──
+            //   (a) catch (Exception) { }        (변수 없음·빈 본문)  → catch (System.X)            식별자 없음
+            //   (b) catch (Exception) { DoLog(); }(변수 없음·비참조 본문) → catch (System.X) { DoLog(); } 식별자 없음
+            //   (c) catch (Exception ex) { Log(ex); }(변수·참조 본문)  → catch (System.X __autoCatchEx) { Exception ex = __autoCatchEx; Log(ex); } 별칭 유지
+            var unusedDir = Path.Combine(fixtureDir, "unusedvar");
+            Directory.CreateDirectory(unusedDir);
+            var unusedPath = Path.Combine(unusedDir, "Unused.cs");
+            File.WriteAllText(unusedPath,
+                "using System;\n" +
+                "class Unused {\n" +
+                "    void A(string s) { try { int.Parse(s); } catch (Exception) { } }\n" +
+                "    void B(string s) { try { int.Parse(s); } catch (Exception) { DoLog(); } }\n" +
+                "    void C(string s) { try { int.Parse(s); } catch (Exception ex) { Log(ex); } }\n" +
+                "    void DoLog() { }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var unusedRes = RunFixSourceOnly(unusedDir, true, allowPartialApplyForSelfTest: true);
+            var unusedText = File.ReadAllText(unusedPath);
+            var unusedTree = CSharpSyntaxTree.ParseText(unusedText);
+            var unusedComp = CSharpCompilation.Create("UnusedCheck")
+                .AddReferences(BuildReferences(unusedDir))
+                .AddSyntaxTrees(unusedTree);
+            var unusedDiags = unusedComp.GetDiagnostics();
+            bool noUnusedWarn = !unusedDiags.Any(d => d.Id == "CS0168" || d.Id == "CS0219");
+            var uMethods = unusedTree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>()
+                .ToDictionary(m => m.Identifier.ValueText);
+            // 생성 catch = 완전수식(System.*) 타입의 catch (fallback 은 원본 그대로 'Exception' 이라 제외됨)
+            List<CatchClauseSyntax> GenCatches(string methodName) =>
+                uMethods[methodName].DescendantNodes().OfType<CatchClauseSyntax>()
+                    .Where(c => c.Declaration != null && c.Declaration.Type.ToString().StartsWith("System.", StringComparison.Ordinal))
+                    .ToList();
+            bool GenNoId(string methodName)
+            {
+                var g = GenCatches(methodName);
+                return g.Count > 0 && g.All(c => string.IsNullOrEmpty(c.Declaration!.Identifier.ValueText));
+            }
+            bool GenAlias(string methodName)
+            {
+                var g = GenCatches(methodName);
+                return g.Count > 0
+                    && g.All(c => c.Declaration!.Identifier.ValueText == "__autoCatchEx")
+                    && uMethods[methodName].ToString().Contains("Exception ex = __autoCatchEx;");
+            }
+            bool aShape = GenNoId("A");
+            bool bShape = GenNoId("B");
+            bool cShape = GenAlias("C");
+            bool t26 = unusedRes.Modified >= 3 && noUnusedWarn && aShape && bShape && cShape;
+            L("--- Unused.cs (after) ---");
+            L(unusedText);
+            L($"[26] 미사용 예외변수 경고 없음(생성 catch): {(t26 ? "PASS" : "FAIL")} (noUnusedWarn={noUnusedWarn}, a(noId)={aShape}, b(noId)={bShape}, c(alias)={cShape}, Modified={unusedRes.Modified})");
+
+            // ── [27] solution-mode per-file 게이팅 통합 ([25]는 source-only 전용이었던 갭 보강) ──
+            //   MSBuildWorkspace/restore 헤드리스 로드는 selftest 환경에서 불안정 → 스펙의 FALLBACK 경로 사용:
+            //   두 문서(Clean/Dirty)를 담은 in-memory 공유 컴파일에 대해 RunFixSolution 과 동일하게
+            //   ProcessFixRoot 를 파일별로 구동하고 ApplyPendingWrites 로 마감. 파일 단위 진단은 트리 스코프라
+            //   Dirty(baseline CS0246)만 스킵되고 Clean 은 적용되는 per-file 게이팅을 그대로 재현한다.
+            var slnGateDir = Path.Combine(fixtureDir, "slngate");
+            Directory.CreateDirectory(slnGateDir);
+            var slnCleanPath = Path.Combine(slnGateDir, "Clean.cs");
+            var slnDirtyPath = Path.Combine(slnGateDir, "Dirty.cs");
+            File.WriteAllText(slnCleanPath,
+                "using System;\n" +
+                "class CleanP { void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }\n");
+            File.WriteAllText(slnDirtyPath,
+                "using System;\n" +
+                "class DirtyP {\n" +
+                "    private Undefined _x;\n" +
+                "    void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var slnDirtyBeforeBytes = File.ReadAllBytes(slnDirtyPath);
+            var slnRes = new FixResult(); // NOT source-only (SourceOnlyDiagnostic=false) → 무결성 전역차단 없음, 솔루션 경로와 동일
+            var (slnCleanCode, slnCleanEnc, slnCleanEol) = ReadSourcePreserving(slnCleanPath);
+            var (slnDirtyCode, slnDirtyEnc, slnDirtyEol) = ReadSourcePreserving(slnDirtyPath);
+            var slnCleanTree = CSharpSyntaxTree.ParseText(slnCleanCode, path: slnCleanPath, encoding: slnCleanEnc);
+            var slnDirtyTree = CSharpSyntaxTree.ParseText(slnDirtyCode, path: slnDirtyPath, encoding: slnDirtyEnc);
+            var slnComp = CSharpCompilation.Create("SlnGate")
+                .AddReferences(BuildReferences(slnGateDir))
+                .AddSyntaxTrees(slnCleanTree, slnDirtyTree);
+            ProcessFixRoot(slnRes, slnCleanPath, slnCleanTree.GetRoot(), slnComp.GetSemanticModel(slnCleanTree), slnComp, true, slnCleanEnc, slnCleanEol);
+            ProcessFixRoot(slnRes, slnDirtyPath, slnDirtyTree.GetRoot(), slnComp.GetSemanticModel(slnDirtyTree), slnComp, true, slnDirtyEnc, slnDirtyEol);
+            ApplyPendingWrites(slnRes);
+            var slnCleanAfter = File.ReadAllText(slnCleanPath);
+            var slnDirtyAfterBytes = File.ReadAllBytes(slnDirtyPath);
+            bool slnCleanApplied = slnCleanAfter.Contains("catch (System.FormatException __autoCatchEx)")
+                                && slnCleanAfter.Contains("catch (Exception ex)"); // broad fallback 보존
+            bool slnDirtyUnchanged = slnDirtyBeforeBytes.SequenceEqual(slnDirtyAfterBytes);
+            bool slnPartial = !slnRes.IsComplete; // SkippedIntegrityFiles>=1 → PARTIAL(exit 2 상당)
+            bool t27 = slnCleanApplied && slnDirtyUnchanged
+                    && slnRes.SkippedIntegrityFiles >= 1 && slnRes.AppliedFileCount >= 1 && slnPartial;
+            L("[27] path=LIGHTER(in-memory ProcessFixRoot per-file; MSBuild/restore 회피)");
+            L("--- slngate/Clean.cs (after) ---");
+            L(slnCleanAfter);
+            L($"[27] solution-mode per-file 게이팅: {(t27 ? "PASS" : "FAIL")} (cleanApplied={slnCleanApplied}, dirtyUnchanged={slnDirtyUnchanged}, SkippedIntegrity={slnRes.SkippedIntegrityFiles}, Applied={slnRes.AppliedFileCount}, PARTIAL={slnPartial})");
+
             allPass = previewUnchanged && t1 && t2 && t3 && t4 && t5 && t6
                    && t7 && t8 && t9 && t10 && t11 && t12
                    && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21
-                   && t22 && t23 && t24 && t25;
+                   && t22 && t23 && t24 && t25 && t26 && t27;
             L(allPass ? "SELFTEST-FIX PASS" : "SELFTEST-FIX FAIL");
         }
         catch (Exception ex)

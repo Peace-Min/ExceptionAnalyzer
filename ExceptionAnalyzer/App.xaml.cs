@@ -41,7 +41,15 @@ namespace ExceptionAnalyzer
             }
             if (e.Args.Length >= 2 && e.Args[0] == "--analyze")
             {
-                try { global::Program.Log = Console.WriteLine; global::Program.AnalyzeDirectory(e.Args[1]); Shutdown(0); }
+                try
+                {
+                    global::Program.Log = Console.WriteLine;
+                    // FIX 4: --fix 처럼 부분 로드를 exit code 로 신호(완전=0, 부분=2, 예외=1).
+                    bool complete = global::Program.AnalyzeDirectory(e.Args[1]);
+                    if (!complete)
+                        Console.WriteLine("분석 부분 완료: 일부 프로젝트/문서 로드 실패");
+                    Shutdown(complete ? 0 : 2);
+                }
                 catch (Exception ex) { Console.WriteLine("ANALYZE ERROR: " + ex); Shutdown(1); }
                 return;
             }

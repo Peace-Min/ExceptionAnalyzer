@@ -35,6 +35,71 @@ namespace ExceptionAnalyzer.Tests
             Assert.Equal(0, global::Program.RunSelfTestFix());
         }
 
+        // FIX 1: 생성 catch 는 미사용 예외변수 경고(CS0168/CS0219)를 유발하지 않아야 한다.
+        //  - 원본에 변수 없음/빈 본문 → catch (System.X) 식별자 없음
+        //  - 원본에 변수·참조 본문   → catch (System.X __autoCatchEx) { Exception ex = __autoCatchEx; ... } 별칭 유지
+        // 대상 프로젝트가 TreatWarningsAsErrors 라도 self-revert 되지 않도록 보장한다.
+        [Fact]
+        public void GeneratedCatch_NoUnusedVariableWarning()
+        {
+            // net472 참조 어셈블리 부재 시 int.Parse 미해석 → 구체 예외 없음. selftest와 동일 전제로 스킵(관용).
+            if (!Directory.Exists(@"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2"))
+                return;
+
+            var dir = Path.Combine(Path.GetTempPath(), "ea_xunit_unusedvar_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var file = Path.Combine(dir, "Unused.cs");
+                File.WriteAllText(file,
+                    "using System;\n" +
+                    "class Unused {\n" +
+                    "    void A(string s) { try { int.Parse(s); } catch (Exception) { } }\n" +
+                    "    void B(string s) { try { int.Parse(s); } catch (Exception) { DoLog(); } }\n" +
+                    "    void C(string s) { try { int.Parse(s); } catch (Exception ex) { Log(ex); } }\n" +
+                    "    void DoLog() { }\n" +
+                    "    void Log(Exception e) { }\n" +
+                    "}\n");
+
+                // selftest와 동일한 apply 시임(RunFixSourceOnly internal + allowPartialApplyForSelfTest).
+                var res = global::Program.RunFixSourceOnly(dir, apply: true, allowPartialApplyForSelfTest: true);
+                var applied = File.ReadAllText(file);
+
+                var tree = CSharpSyntaxTree.ParseText(applied);
+                var comp = CSharpCompilation.Create("UnusedCheck")
+                    .AddReferences(global::Program.BuildReferences(dir))
+                    .AddSyntaxTrees(tree);
+                var diags = comp.GetDiagnostics();
+
+                Assert.True(res.Modified >= 3);
+                Assert.DoesNotContain(diags, d => d.Id == "CS0168" || d.Id == "CS0219");
+
+                var methods = tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>()
+                    .ToDictionary(m => m.Identifier.ValueText);
+                List<CatchClauseSyntax> GenCatches(string name) =>
+                    methods[name].DescendantNodes().OfType<CatchClauseSyntax>()
+                        .Where(c => c.Declaration != null && c.Declaration.Type.ToString().StartsWith("System.", StringComparison.Ordinal))
+                        .ToList();
+
+                // (a)/(b): 생성 catch 는 식별자 없음
+                foreach (var m in new[] { "A", "B" })
+                {
+                    var g = GenCatches(m);
+                    Assert.NotEmpty(g);
+                    Assert.All(g, c => Assert.True(string.IsNullOrEmpty(c.Declaration!.Identifier.ValueText)));
+                }
+                // (c): 별칭 형태 유지
+                var cGen = GenCatches("C");
+                Assert.NotEmpty(cGen);
+                Assert.All(cGen, c => Assert.Equal("__autoCatchEx", c.Declaration!.Identifier.ValueText));
+                Assert.Contains("Exception ex = __autoCatchEx;", methods["C"].ToString());
+            }
+            finally
+            {
+                if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            }
+        }
+
         // P1-9 진단 지문: 같은 ID(CS0029)의 오류가 1→2 로 늘면 '신규 오류'로 검출,
         // 동일 입력이면 빈 목록이어야 한다.
         [Fact]
