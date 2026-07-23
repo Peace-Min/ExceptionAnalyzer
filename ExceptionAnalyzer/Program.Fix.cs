@@ -34,10 +34,15 @@ internal partial class Program
         // 무결성 위협(파일 미컴파일/source-only 정책 등)만 apply 를 차단한다.
         public List<string> IntegrityFailures = new List<string>();
         public int SkippedDocuments;
+        // 파일별 best-effort 게이팅: baseline 컴파일 오류로 '적용'에서 제외된 파일 수(REPORTING 카운터).
+        public int SkippedIntegrityFiles;
+        // source-only(.sln/MSBuildWorkspace 없이) 진단 전용 모드 여부 — 프로덕션에서는 절대 파일을 쓰지 않는다.
+        public bool SourceOnlyDiagnostic;
         // 권고2: 저장 실패를 성공으로 오보하지 않도록 별도 플래그로 추적.
         public bool ApplyFailed;
         public int AppliedFileCount;
-        public bool IsComplete => WorkspaceFailures.Count == 0 && IntegrityFailures.Count == 0 && SkippedDocuments == 0;
+        // IsComplete 는 이제 '보고' 플래그(= exit code 결정). apply 게이트가 아니다 — 클린 파일은 PARTIAL 이어도 적용된다.
+        public bool IsComplete => WorkspaceFailures.Count == 0 && IntegrityFailures.Count == 0 && SkippedDocuments == 0 && SkippedIntegrityFiles == 0;
         public bool HasCoverageGaps => CoverageWarnings.Count > 0;
 
         public void AddCoverageWarning(string message)
@@ -416,9 +421,14 @@ internal partial class Program
         var tries = root.DescendantNodes().OfType<TryStatementSyntax>().ToList();
         if (tries.Count == 0) return;
 
-        var baselineErrors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
-        // 권고1: 파일이 컴파일되지 않으면 의미 분석 자체가 신뢰 불가 → 무결성 위협(차단).
-        if (baselineErrors.Count > 0)
+        // 파일별 best-effort 게이팅: 이 파일(트리) 자체의 컴파일 오류만 본다.
+        // semanticModel.GetDiagnostics() 는 트리 범위 진단 → 프로젝트 전체 및 CS5001(no-entry) 같은
+        // 컴파일-레벨 잡음을 제외하고, 이 파일에서 실제로 발현되는 오류(예: 미해결 타입 CS0246)만 집계한다.
+        var baselineErrors = semanticModel.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+        // baseline 이 깨진 파일은 의미 분석 신뢰 불가 → 이 파일만 적용 스킵(아래 파일 단위 게이트).
+        bool fileHasBaselineErrors = baselineErrors.Count > 0;
+        // REPORTING: completeness=PARTIAL(exit 2) 을 유발하되, 다른 클린 파일 적용을 막지 않는다.
+        if (fileHasBaselineErrors)
             res.AddIntegrityFailure($"{file} — baseline compilation errors: {string.Join(", ", baselineErrors.Take(5).Select(d => d.Id))}");
 
         // FIX 3: 사전 빌드한 newTry 대신 (원본 try → 구체 타입/키) 매핑만 수집하고,
@@ -529,8 +539,18 @@ internal partial class Program
         previews.Sort((a, b) => a.line.CompareTo(b.line));
         res.PreviewBlocks.AddRange(previews.Select(p => p.block));
 
+        // 파일별 best-effort 게이팅: baseline 이 깨진 파일은 미리보기(PreviewBlocks)는 만들되(가시성) 실제 적용에서 제외.
+        // → Modified 미증가·PendingWrite 미추가 이므로, 같은 배치의 다른 클린 파일들은 정상 적용된다.
+        if (fileHasBaselineErrors)
+        {
+            res.SkippedIntegrityFiles++;
+            res.ManualReview.Add($"{file} (적용 스킵: baseline 컴파일 오류 — 분석 신뢰불가, 이 파일만 제외)");
+            return;
+        }
+
         // 치환된 과도-넓음 catch 수 = 적격 try 수 (중첩 자식은 부모 재구성 시 텍스트로 흡수되어 주석이 소실될 수 있으므로
         // 주석 노드 수가 아닌 typesFor.Count 로 집계한다 — 중첩 케이스에서 실제 치환 건수를 정확히 반영).
+        // Modified 는 '실제 적용될 클린 파일'의 catch 만 집계한다(dirty 파일의 예상 수정은 PreviewBlocks+SkippedIntegrityFiles 로만 가시화).
         res.Modified += typesFor.Count;
 
         if (apply)
@@ -603,11 +623,10 @@ internal partial class Program
             }
         }
 
-        if (apply)
-        {
-            if (res.IsComplete) ApplyPendingWrites(res);
-            else res.ManualReview.Add($"{solutionPath} (적용 차단: scan 중 Completeness=PARTIAL)");
-        }
+        // 파일별 best-effort: PendingWrites 에는 클린 파일 쓰기만 담겨 있으므로(dirty 파일은 ProcessFixRoot 에서 제외됨),
+        // 솔루션이 PARTIAL(일부 프로젝트 로드 실패/일부 파일 baseline 오류)이어도 클린 파일은 항상 적용한다.
+        // 완전성은 IsComplete/exit code 로만 '보고'된다 — 더 이상 apply 를 게이팅하지 않는다.
+        if (apply) ApplyPendingWrites(res);
 
         return res;
     }
@@ -616,7 +635,8 @@ internal partial class Program
     {
         EnsureCodePagesRegistered();
         var res = new FixResult();
-        // 권고1: source-only 는 .sln/MSBuildWorkspace 없이 파일 단위 분석 → 진단 전용(apply 차단). 무결성 정책.
+        res.SourceOnlyDiagnostic = true;
+        // source-only 는 .sln/MSBuildWorkspace 없이 파일 단위 분석 → 진단 전용(프로덕션은 실제 적용 안 함). 무결성 정책.
         res.AddIntegrityFailure($"{target} — source-only 모드: .sln/MSBuildWorkspace 없이 파일 단위 분석 → 진단 전용(apply 차단)");
 
         var references = BuildReferences(target);
@@ -640,8 +660,9 @@ internal partial class Program
 
         if (apply)
         {
-            if (res.IsComplete || allowPartialApplyForSelfTest) ApplyPendingWrites(res);
-            else res.ManualReview.Add($"{target} (적용 차단: scan 중 Completeness=PARTIAL)");
+            // 프로덕션 source-only 는 절대 적용하지 않는다(진단 전용). selftest 바이패스에서만 클린 파일을 적용.
+            if (allowPartialApplyForSelfTest) ApplyPendingWrites(res);
+            else res.ManualReview.Add($"{target} (source-only 진단 전용 — 실제 적용 안 함, 적용 차단)");
         }
 
         return res;
@@ -654,16 +675,8 @@ internal partial class Program
             LoadXmlDocumentation();
         }
 
-        if (apply)
-        {
-            var preview = RunFix(target, apply: false, allowSourceOnlyFallback);
-            if (!preview.IsComplete)
-            {
-                preview.ManualReview.Add($"{target} (적용 차단: Completeness=PARTIAL)");
-                return preview;
-            }
-        }
-
+        // 파일별 best-effort 게이팅(ProcessFixRoot)이 안전을 보장하므로, apply 전 전체 preview 게이트를 제거한다.
+        // (이 블록은 apply 경로에서 스캔을 3회로 늘리던 낭비이기도 했다 — 이제 apply 는 1회 스캔으로 직접 진행.)
         var solutionPath = TryResolveSingleSolutionPath(target);
         if (solutionPath != null) return RunFixSolution(solutionPath, apply);
         if (!allowSourceOnlyFallback)
@@ -682,7 +695,9 @@ internal partial class Program
     {
         var sb = new StringBuilder();
         sb.AppendLine($"===== EXCEPTION FIX REPORT MODE={(apply ? "APPLY" : "PREVIEW")} =====");
-        sb.AppendLine($"Modified            : {res.Modified}");
+        // Modified = '적용 대상(클린 파일)'의 치환 catch 수. baseline 오류 파일은 SkippedIntegrityFiles 로 분리 집계.
+        sb.AppendLine($"Modified(적용대상=클린) : {res.Modified}");
+        sb.AppendLine($"SkippedIntegrityFiles : {res.SkippedIntegrityFiles}");
         sb.AppendLine($"Skipped_NonTrivial  : {res.Skipped_NonTrivial}");
         sb.AppendLine($"Skipped_Empty       : {res.Skipped_Empty}");
         sb.AppendLine($"Skipped_NotBroad    : {res.Skipped_NotBroad}");

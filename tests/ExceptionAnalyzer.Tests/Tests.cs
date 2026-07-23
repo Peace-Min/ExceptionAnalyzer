@@ -157,6 +157,17 @@ class C {
             Assert.False(r.IsComplete);
         }
 
+        // 파일별 best-effort 게이팅: baseline 오류로 적용 스킵된 파일(SkippedIntegrityFiles)이 있으면
+        // 완전성 보고는 PARTIAL(IsComplete=false, exit 2)이어야 한다. (클린 파일 적용 자체는 막지 않음 — 종단 검증은 selftest [25].)
+        [Fact]
+        public void IsComplete_False_WhenSkippedIntegrityFiles()
+        {
+            var r = new global::Program.FixResult();
+            Assert.True(r.IsComplete); // 아무 문제 없으면 Complete
+            r.SkippedIntegrityFiles = 1;
+            Assert.False(r.IsComplete); // 파일별 무결성 스킵이 있으면 PARTIAL
+        }
+
         // 권고3: scan 이후 외부 수정 감지 시(ExpectedOriginalBytes 불일치) 배치 전체 쓰기를 중단하고 실패로 보고.
         [Fact]
         public void ApplyPendingWrites_DetectsExternalModification()

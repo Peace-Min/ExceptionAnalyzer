@@ -641,10 +641,42 @@ internal partial class Program
             bool t24 = !r24.ApplyFailed && okAfter == "updated body" && r24.AppliedFileCount == 1;
             L($"[24] 해시 일치 시 정상 적용: {(t24 ? "PASS" : "FAIL")} (applyFailed={r24.ApplyFailed}, updated={okAfter == "updated body"}, appliedCount={r24.AppliedFileCount})");
 
+            // ── [25] 파일별 best-effort 게이팅 : 클린 파일은 적용, baseline 오류 파일은 스킵(다른 클린 파일 적용을 막지 않음) ──
+            var gatingDir = Path.Combine(fixtureDir, "gating");
+            Directory.CreateDirectory(gatingDir);
+            var cleanPath = Path.Combine(gatingDir, "Clean.cs");
+            var dirtyPath = Path.Combine(gatingDir, "Dirty.cs");
+            // 클린: 적격 broad catch(int.Parse) — baseline 컴파일 클린
+            File.WriteAllText(cleanPath,
+                "using System;\n" +
+                "class Clean { void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }\n");
+            // dirty: 동일한 적격 broad catch 이지만, 미해결 타입 필드(CS0246)로 baseline 컴파일 오류를 가짐
+            File.WriteAllText(dirtyPath,
+                "using System;\n" +
+                "class Dirty {\n" +
+                "    private Undefined _x;\n" +
+                "    void M(string s) { try { int n = int.Parse(s); } catch (Exception ex) { Log(ex); } }\n" +
+                "    void Log(Exception e) { }\n" +
+                "}\n");
+            var cleanBeforeBytes = File.ReadAllBytes(cleanPath);
+            var dirtyBeforeBytes = File.ReadAllBytes(dirtyPath);
+            var gatingRes = RunFixSourceOnly(gatingDir, true, allowPartialApplyForSelfTest: true);
+            var cleanAfterBytes = File.ReadAllBytes(cleanPath);
+            var dirtyAfterBytes = File.ReadAllBytes(dirtyPath);
+            var cleanAfterText = File.ReadAllText(cleanPath);
+            bool cleanApplied = !cleanBeforeBytes.SequenceEqual(cleanAfterBytes)
+                             && cleanAfterText.Contains("catch (System.FormatException __autoCatchEx)")
+                             && cleanAfterText.Contains("catch (Exception ex)"); // broad fallback 보존
+            bool dirtyUnchanged = dirtyBeforeBytes.SequenceEqual(dirtyAfterBytes);
+            bool t25 = cleanApplied && dirtyUnchanged && gatingRes.SkippedIntegrityFiles >= 1 && gatingRes.Modified >= 1;
+            L("--- gating/Clean.cs (after) ---");
+            L(cleanAfterText);
+            L($"[25] 파일별 best-effort 게이팅: {(t25 ? "PASS" : "FAIL")} (cleanApplied={cleanApplied}, dirtyUnchanged={dirtyUnchanged}, SkippedIntegrity={gatingRes.SkippedIntegrityFiles}, Modified={gatingRes.Modified})");
+
             allPass = previewUnchanged && t1 && t2 && t3 && t4 && t5 && t6
                    && t7 && t8 && t9 && t10 && t11 && t12
                    && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21
-                   && t22 && t23 && t24;
+                   && t22 && t23 && t24 && t25;
             L(allPass ? "SELFTEST-FIX PASS" : "SELFTEST-FIX FAIL");
         }
         catch (Exception ex)

@@ -68,29 +68,20 @@ namespace ExceptionAnalyzer
                 }
                 LogBox.ScrollToEnd();
 
-                // 3) 수정 대상이 없으면 적용 없이 종료
+                // 3) 적용 대상(클린 파일)이 없으면 적용 없이 종료 (무결성 스킵 파일은 안내만)
                 if (preview.Modified == 0)
                 {
                     System.Windows.MessageBox.Show(
-                        $"수정 대상이 없습니다. (수동검토 {preview.Skipped_NonTrivial}건)",
+                        $"적용 대상(클린 파일)이 없습니다.\n\n  무결성 스킵 : {preview.SkippedIntegrityFiles}개 파일 (baseline 오류로 제외)\n  수동 검토   : {preview.Skipped_NonTrivial}건",
                         "미리보기 결과", MessageBoxButton.OK, MessageBoxImage.Information);
-                    StatusText.Text = $"상태: 완료 - 수정 대상 없음 (수동검토 {preview.Skipped_NonTrivial}건)";
+                    StatusText.Text = $"상태: 완료 - 적용 대상 없음 (무결성 스킵 {preview.SkippedIntegrityFiles}, 수동검토 {preview.Skipped_NonTrivial}건)";
                     return;
                 }
 
-                if (!preview.IsComplete)
-                {
-                    global::Program.WriteFixReport(preview, apply: false);
-                    System.Windows.MessageBox.Show(
-                        "무결성 문제(워크스페이스/baseline/문서 누락)로 적용을 차단합니다.\n\nfix-report.txt의 INTEGRITY FAILURES와 수동 검토 목록을 먼저 확인하세요.",
-                        "무결성 문제 - 적용 차단", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    StatusText.Text = "상태: 미리보기 완료 - 무결성 문제로 적용 차단";
-                    return;
-                }
-
-                // 4) 안내된(informed) 확인 — 미리보기 수치 요약 + 되돌리기 경고
+                // 4) 안내된(informed) 확인 — 미리보기 수치 요약 + 스킵/되돌리기 경고
+                //    파일별 best-effort: 클린 파일만 수정하고, baseline 오류 파일은 무결성 스킵으로 제외한다(하드 차단 없음).
                 var confirm = System.Windows.MessageBox.Show(
-                    $"미리보기 결과:\n\n  수정 예정 catch : {preview.Modified}건\n  수동 검토      : {preview.Skipped_NonTrivial}건\n  완전도        : {(preview.IsComplete ? "Complete" : "PARTIAL — 무결성 문제")}\n  커버리지 참고 : {preview.CoverageWarnings.Count}건 (비차단, fallback 보존)\n\n위 미리보기(로그창) 내용대로 소스 파일을 직접 수정합니다.\n되돌리려면 git 등 버전관리가 필요합니다.\n\n적용할까요?",
+                    $"미리보기 결과:\n\n  수정 예정 catch : {preview.Modified}건 (클린 파일)\n  무결성 스킵   : {preview.SkippedIntegrityFiles}개 파일 (baseline 오류로 제외)\n  수동 검토      : {preview.Skipped_NonTrivial}건\n  완전도        : {(preview.IsComplete ? "Complete" : "PARTIAL — 일부 파일 제외")}\n  커버리지 참고 : {preview.CoverageWarnings.Count}건 (비차단, fallback 보존)\n\n클린 파일만 소스에 직접 수정합니다(무결성 스킵 파일은 변경하지 않음).\n되돌리려면 git 등 버전관리가 필요합니다.\n\n적용할까요?",
                     "소스 자동수정 적용", MessageBoxButton.YesNo, MessageBoxImage.Warning);
                 if (confirm != MessageBoxResult.Yes)
                 {
@@ -122,7 +113,7 @@ namespace ExceptionAnalyzer
                     if (res.ApplyFailed)
                         StatusText.Text = "상태: 오류 - 저장 실패(롤백 시도됨). fix-report 확인";
                     else
-                        StatusText.Text = $"상태: 완료 - catch {res.Modified}건 수정, 수동검토 {res.Skipped_NonTrivial}건, 되돌림 {res.CompileReverted}건 (fix-report.txt 생성)";
+                        StatusText.Text = $"상태: 완료 - catch {res.Modified}건 수정, 무결성 스킵 {res.SkippedIntegrityFiles}개, 수동검토 {res.Skipped_NonTrivial}건, 되돌림 {res.CompileReverted}건 (fix-report.txt 생성)";
                 }
                 catch (Exception ex)
                 {
