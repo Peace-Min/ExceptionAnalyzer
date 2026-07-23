@@ -30,13 +30,26 @@ internal partial class Program
         // P1-11: 완전성(completeness) 추적 — 워크스페이스 로드 실패/건너뛴 문서가 있으면 부분 수행.
         public List<string> WorkspaceFailures = new List<string>();
         public List<string> CoverageWarnings = new List<string>();
+        // 권고1: 커버리지 갭은 fallback(원본 broad catch)으로 런타임 안전 → 비차단 정보성.
+        // 무결성 위협(파일 미컴파일/source-only 정책 등)만 apply 를 차단한다.
+        public List<string> IntegrityFailures = new List<string>();
         public int SkippedDocuments;
-        public bool IsComplete => WorkspaceFailures.Count == 0 && CoverageWarnings.Count == 0 && SkippedDocuments == 0;
+        // 권고2: 저장 실패를 성공으로 오보하지 않도록 별도 플래그로 추적.
+        public bool ApplyFailed;
+        public int AppliedFileCount;
+        public bool IsComplete => WorkspaceFailures.Count == 0 && IntegrityFailures.Count == 0 && SkippedDocuments == 0;
+        public bool HasCoverageGaps => CoverageWarnings.Count > 0;
 
         public void AddCoverageWarning(string message)
         {
             if (!CoverageWarnings.Contains(message, StringComparer.OrdinalIgnoreCase))
                 CoverageWarnings.Add(message);
+        }
+
+        public void AddIntegrityFailure(string m)
+        {
+            if (!IntegrityFailures.Contains(m, StringComparer.OrdinalIgnoreCase))
+                IntegrityFailures.Add(m);
         }
     }
 
@@ -193,9 +206,25 @@ internal partial class Program
         }
     }
 
-    private static void ApplyPendingWrites(FixResult res)
+    // internal: selftest/xunit 테스트 시임(테스트에서 직접 호출). 쓰기 메커니즘·롤백 의미는 불변.
+    internal static void ApplyPendingWrites(FixResult res)
     {
         if (res.PendingWrites.Count == 0) return;
+
+        // 권고3(G6): content-hash TOCTOU 가드 — scan 시점에 읽어둔 원본 바이트와
+        // 지금 디스크 바이트를 대조해, 스캔 이후 외부 수정이 있으면 배치 전체를 중단(all-or-nothing).
+        foreach (var write in res.PendingWrites)
+        {
+            byte[] current;
+            try { current = File.ReadAllBytes(write.File); }
+            catch (Exception ex) { res.ApplyFailed = true; res.ManualReview.Add($"{write.File} (적용 전 재확인 실패: {ex.GetType().Name})"); return; }
+            if (!current.AsSpan().SequenceEqual(write.ExpectedOriginalBytes))
+            {
+                res.ApplyFailed = true;
+                res.ManualReview.Add($"{write.File} (외부 수정 감지 — 스캔 이후 파일이 변경됨, 배치 전체 적용 중단)");
+                return; // write nothing (all-or-nothing)
+            }
+        }
 
         var originals = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         foreach (var write in res.PendingWrites)
@@ -208,10 +237,12 @@ internal partial class Program
         {
             foreach (var write in res.PendingWrites)
                 AtomicWriteAllText(write.File, write.Text, write.Encoding);
+            res.AppliedFileCount = res.PendingWrites.Count;
         }
         catch (Exception ex)
         {
-            res.CompileReverted += res.PendingWrites.Count;
+            // 권고2: 쓰기 실패는 CompileReverted(컴파일 되돌림)가 아니라 ApplyFailed 로 보고.
+            res.ApplyFailed = true;
             res.ManualReview.Add($"batch apply rollback: {ex.GetType().Name} {ex.Message}");
             foreach (var original in originals)
             {
@@ -223,16 +254,19 @@ internal partial class Program
 
     internal sealed class PendingWrite
     {
-        public PendingWrite(string file, string text, Encoding encoding)
+        public PendingWrite(string file, string text, Encoding encoding, byte[] expectedOriginalBytes)
         {
             File = file;
             Text = text;
             Encoding = encoding;
+            ExpectedOriginalBytes = expectedOriginalBytes;
         }
 
         public string File { get; }
         public string Text { get; }
         public Encoding Encoding { get; }
+        // 권고3: scan 시점에 읽은 원본 바이트(쓰기는 지연되므로 이 시점 파일은 여전히 원본).
+        public byte[] ExpectedOriginalBytes { get; }
     }
 
     private static bool IsFrameworkNamespace(string? ns)
@@ -383,8 +417,9 @@ internal partial class Program
         if (tries.Count == 0) return;
 
         var baselineErrors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+        // 권고1: 파일이 컴파일되지 않으면 의미 분석 자체가 신뢰 불가 → 무결성 위협(차단).
         if (baselineErrors.Count > 0)
-            res.AddCoverageWarning($"{file} — baseline compilation errors: {string.Join(", ", baselineErrors.Take(5).Select(d => d.Id))}");
+            res.AddIntegrityFailure($"{file} — baseline compilation errors: {string.Join(", ", baselineErrors.Take(5).Select(d => d.Id))}");
 
         // FIX 3: 사전 빌드한 newTry 대신 (원본 try → 구체 타입/키) 매핑만 수집하고,
         // 실제 치환은 ReplaceNodes 콜백의 rewritten 인자로 만들어 자식 fix 를 보존한다.
@@ -430,16 +465,18 @@ internal partial class Program
             }
 
             // 적격 대상: 구체 예외 추론
-            CollectCoverageWarnings(res, file, line, tryStmt, semanticModel, compilation, semanticContexts, methodContexts);
             var exMap = AnalyzeTryBlock(tryStmt, semanticModel, compilation: compilation, semanticContexts: semanticContexts, methodContexts: methodContexts);
             var types = GetOrderedResolvedCatchTypes(compilation, exMap);
             if (types.Count == 0)
             {
-                // catch-less try 를 절대 만들지 않음
+                // catch-less try 를 절대 만들지 않음 (skip-empty 는 ManualReview 로만 — 커버리지 노트 미발행)
                 res.Skipped_Empty++;
                 res.ManualReview.Add($"{file}:{line} (건너뜀: 추론된 구체 예외 없음)");
                 continue;
             }
+
+            // 권고1b: 실제로 수정될 try(적격 + types>0)에 대해서만 커버리지 노트를 res 에 커밋.
+            CollectCoverageWarnings(res, file, line, tryStmt, semanticModel, compilation, semanticContexts, methodContexts);
 
             var key = (idx++).ToString();
             typesFor[tryStmt] = types;
@@ -498,7 +535,8 @@ internal partial class Program
 
         if (apply)
         {
-            res.PendingWrites.Add(new PendingWrite(file, formattedText, enc));
+            // 권고3: 쓰기는 지연되므로 이 시점 파일은 여전히 원본 → 원본 바이트를 캡처해 적용 직전 대조.
+            res.PendingWrites.Add(new PendingWrite(file, formattedText, enc, File.ReadAllBytes(file)));
         }
     }
 
@@ -578,7 +616,8 @@ internal partial class Program
     {
         EnsureCodePagesRegistered();
         var res = new FixResult();
-        res.AddCoverageWarning($"{target} — source-only 모드: .sln/MSBuildWorkspace 없이 파일 단위 의미 분석을 수행하므로 결과는 PARTIAL");
+        // 권고1: source-only 는 .sln/MSBuildWorkspace 없이 파일 단위 분석 → 진단 전용(apply 차단). 무결성 정책.
+        res.AddIntegrityFailure($"{target} — source-only 모드: .sln/MSBuildWorkspace 없이 파일 단위 분석 → 진단 전용(apply 차단)");
 
         var references = BuildReferences(target);
         var csFiles = Directory.GetFiles(target, "*.cs", SearchOption.AllDirectories);
@@ -649,8 +688,15 @@ internal partial class Program
         sb.AppendLine($"Skipped_NotBroad    : {res.Skipped_NotBroad}");
         sb.AppendLine($"CompileReverted     : {res.CompileReverted}");
         sb.AppendLine($"SkippedDocuments    : {res.SkippedDocuments}");
+        sb.AppendLine($"IntegrityFailures   : {res.IntegrityFailures.Count}");
         sb.AppendLine($"CoverageWarnings    : {res.CoverageWarnings.Count}");
-        sb.AppendLine($"Completeness       : {(res.IsComplete ? "Complete" : "PARTIAL")}");
+        sb.AppendLine($"ApplyFailed         : {res.ApplyFailed}");
+        if (apply)
+            sb.AppendLine($"AppliedFiles       : {res.AppliedFileCount}");
+        var completeness = res.IsComplete
+            ? (res.HasCoverageGaps ? $"Complete (커버리지 참고 {res.CoverageWarnings.Count}건 — 비차단)" : "Complete")
+            : "PARTIAL";
+        sb.AppendLine($"Completeness       : {completeness}");
         sb.AppendLine();
         if (res.WorkspaceFailures.Count > 0)
         {
@@ -658,9 +704,15 @@ internal partial class Program
             foreach (var wf in res.WorkspaceFailures) sb.AppendLine(wf);
             sb.AppendLine();
         }
+        if (res.IntegrityFailures.Count > 0)
+        {
+            sb.AppendLine("----- INTEGRITY FAILURES (차단) -----");
+            foreach (var f in res.IntegrityFailures) sb.AppendLine(f);
+            sb.AppendLine();
+        }
         if (res.CoverageWarnings.Count > 0)
         {
-            sb.AppendLine("----- COVERAGE WARNINGS -----");
+            sb.AppendLine("----- COVERAGE NOTES (비차단 — fallback 보존으로 런타임 안전) -----");
             foreach (var cw in res.CoverageWarnings) sb.AppendLine(cw);
             sb.AppendLine();
         }

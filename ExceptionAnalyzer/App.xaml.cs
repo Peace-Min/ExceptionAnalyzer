@@ -33,7 +33,7 @@ namespace ExceptionAnalyzer
                         if (!preview.IsComplete)
                         {
                             global::Program.WriteFixReport(preview, apply: false);
-                            Console.WriteLine("FIX BLOCKED: Completeness=PARTIAL 상태에서는 --apply를 수행하지 않습니다. fix-report.txt의 WORKSPACE FAILURES와 MANUAL REVIEW를 먼저 확인하세요.");
+                            Console.WriteLine("FIX BLOCKED: 무결성 문제(워크스페이스/baseline/문서 누락 등)로 --apply를 수행하지 않습니다. fix-report.txt의 INTEGRITY FAILURES와 MANUAL REVIEW를 먼저 확인하세요.");
                             Shutdown(2);
                             return;
                         }
@@ -41,8 +41,10 @@ namespace ExceptionAnalyzer
 
                     res = global::Program.RunFix(e.Args[1], apply, sourceOnly);
                     global::Program.WriteFixReport(res, apply);
-                    // P1-11: 부분 수행(워크스페이스 실패/문서 건너뜀)은 exit 2 로 구분.
-                    Shutdown(res.IsComplete ? 0 : 2);
+                    // 권고2: 저장 실패는 성공이 아닌 실패로 보고(exit 1). 부분 수행(무결성)은 exit 2.
+                    if (res.ApplyFailed)
+                        Console.WriteLine("FIX APPLY FAILED: 파일 저장에 실패했습니다(롤백 시도됨). fix-report.txt를 확인하세요.");
+                    Shutdown(res.ApplyFailed ? 1 : (res.IsComplete ? 0 : 2));
                 }
                 catch (Exception ex) { Console.WriteLine("FIX ERROR: " + ex); Shutdown(1); }
                 return;

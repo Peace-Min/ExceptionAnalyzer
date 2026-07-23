@@ -74,7 +74,8 @@ namespace ExceptionAnalyzer.Tests
                 var result = global::Program.RunFix(dir, apply: true, allowSourceOnlyFallback: true);
 
                 Assert.False(result.IsComplete);
-                Assert.Contains(result.CoverageWarnings, m => m.Contains("source-only"));
+                // 권고1: source-only 정책은 커버리지 경고가 아니라 무결성 실패(차단)로 이동.
+                Assert.Contains(result.IntegrityFailures, m => m.Contains("source-only"));
                 Assert.Contains(result.ManualReview, m => m.Contains("적용 차단"));
                 Assert.Equal(source, File.ReadAllText(file));
             }
@@ -116,25 +117,66 @@ class C {
             Assert.DoesNotContain("System.FormatException", result.Keys);
         }
 
+        // 권고1: 미지원 실행 지점(foreach 등)은 이제 비차단 커버리지 노트로만 기록된다.
+        // apply 차단은 커버리지가 아니라 source-only 무결성 정책이 담당한다(파일 불변 확인).
         [Fact]
-        public void RunFix_UnsupportedExecutionCoverageBlocksApply()
+        public void RunFix_UnsupportedExecutionEmitsCoverageNote_SourceOnlyBlocksApply()
         {
             var dir = Path.Combine(Path.GetTempPath(), "ea_xunit_unsupported_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(dir);
             try
             {
                 var file = Path.Combine(dir, "Unsupported.cs");
+                // int.Parse 로 구체 예외를 확보(types>0) → try 가 수정 대상이 되어 foreach 커버리지 노트가 기록됨.
                 var source =
                     "using System; using System.Collections.Generic; " +
                     "struct Risky { public static Risky operator +(Risky a, Risky b) => throw new InvalidOperationException(); } " +
-                    "class C { void M(IEnumerable<int> xs) { try { var r = new Risky() + new Risky(); foreach (var x in xs) { } } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }";
+                    "class C { void M(string s, IEnumerable<int> xs) { try { int n = int.Parse(s); var r = new Risky() + new Risky(); foreach (var x in xs) { } } catch (Exception ex) { Log(ex); } } void Log(Exception e) { } }";
                 File.WriteAllText(file, source);
 
                 var result = global::Program.RunFix(dir, apply: true, allowSourceOnlyFallback: true);
 
-                Assert.False(result.IsComplete);
+                Assert.False(result.IsComplete); // source-only 무결성 실패
                 Assert.Contains(result.CoverageWarnings, m => m.Contains("미지원 실행 지점"));
-                Assert.Equal(source, File.ReadAllText(file));
+                Assert.Equal(source, File.ReadAllText(file)); // apply 차단 → 파일 불변
+            }
+            finally
+            {
+                if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        // 권고1: 커버리지 경고만으로는 IsComplete 를 막지 못하고, 무결성 실패는 막는다.
+        [Fact]
+        public void IsComplete_CoverageWarningIsNonBlocking()
+        {
+            var r = new global::Program.FixResult();
+            r.AddCoverageWarning("x");
+            Assert.True(r.IsComplete);
+            r.AddIntegrityFailure("y");
+            Assert.False(r.IsComplete);
+        }
+
+        // 권고3: scan 이후 외부 수정 감지 시(ExpectedOriginalBytes 불일치) 배치 전체 쓰기를 중단하고 실패로 보고.
+        [Fact]
+        public void ApplyPendingWrites_DetectsExternalModification()
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "ea_xunit_toctou_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var file = Path.Combine(dir, "T.cs");
+                var original = "original content";
+                File.WriteAllText(file, original);
+
+                var r = new global::Program.FixResult();
+                r.PendingWrites.Add(new global::Program.PendingWrite(
+                    file, "new content", System.Text.Encoding.UTF8, System.Text.Encoding.UTF8.GetBytes("DIFFERENT")));
+
+                global::Program.ApplyPendingWrites(r);
+
+                Assert.True(r.ApplyFailed);
+                Assert.Equal(original, File.ReadAllText(file));
             }
             finally
             {

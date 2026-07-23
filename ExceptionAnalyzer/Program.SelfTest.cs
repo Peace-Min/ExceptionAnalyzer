@@ -559,10 +559,10 @@ internal partial class Program
                     && filterRes.ManualReview.Any(m => m.Contains("catch filter"));
             L($"[18] catch filter 보존/스킵: {(t18 ? "PASS" : "FAIL")} (Modified={filterRes.Modified}, NonTrivial={filterRes.Skipped_NonTrivial})");
 
-            // ── [19] coverage completeness : source-only 모드는 결과를 Complete 로 보고하지 않음 ──
+            // ── [19] integrity completeness : source-only 모드는 무결성 실패(IntegrityFailure)로 PARTIAL 보고 ──
             bool t19 = !res.IsComplete
-                    && res.CoverageWarnings.Any(m => m.Contains("source-only"));
-            L($"[19] coverage completeness: {(t19 ? "PASS" : "FAIL")} (sourceOnlyPartial={!res.IsComplete}, warnings={res.CoverageWarnings.Count})");
+                    && res.IntegrityFailures.Count > 0;
+            L($"[19] integrity completeness (source-only PARTIAL): {(t19 ? "PASS" : "FAIL")} (partial={!res.IsComplete}, integrity={res.IntegrityFailures.Count}, coverage={res.CoverageWarnings.Count})");
 
             // ── [20] public API apply gate : PARTIAL(source-only) 은 직접 RunFix apply 도 쓰기 금지 ──
             var publicGateDir = Path.Combine(fixtureDir, "publicgate");
@@ -579,31 +579,72 @@ internal partial class Program
                     && publicGateRes.ManualReview.Any(m => m.Contains("적용 차단"));
             L($"[20] public API PARTIAL apply gate: {(t20 ? "PASS" : "FAIL")} (unchanged={publicGateAfter == publicGateBefore}, ModifiedPreview={publicGateRes.Modified}, Complete={publicGateRes.IsComplete})");
 
-            // ── [21] unsupported execution coverage : operator/foreach/using 같은 미지원 실행 지점은 Complete 금지 ──
-            var unsupportedDir = Path.Combine(fixtureDir, "unsupported");
-            Directory.CreateDirectory(unsupportedDir);
-            var unsupportedPath = Path.Combine(unsupportedDir, "Unsupported.cs");
-            File.WriteAllText(unsupportedPath,
+            // ── [21] coverage gap 은 비차단 : foreach/using 커버리지 노트가 있어도 fix 는 정상 적용됨 ──
+            //     (권고1) 원본 broad catch 를 fallback 으로 보존하므로 커버리지 갭은 런타임 안전 → apply 를 막지 않는다.
+            var covDir = Path.Combine(fixtureDir, "coveragegap");
+            Directory.CreateDirectory(covDir);
+            var covPath = Path.Combine(covDir, "CoverageGap.cs");
+            File.WriteAllText(covPath,
                 "using System;\nusing System.Collections.Generic;\n" +
-                "struct Risky { public static Risky operator +(Risky a, Risky b) => throw new InvalidOperationException(); }\n" +
-                "class U {\n" +
-                "  void M(IEnumerable<int> xs, IDisposable d) {\n" +
-                "    try { var r = new Risky() + new Risky(); foreach (var x in xs) { } using (d) { } }\n" +
+                "class Cg {\n" +
+                "  void M(string s, IEnumerable<int> xs, IDisposable d) {\n" +
+                "    try { int n = int.Parse(s); foreach (var x in xs) { } using (d) { } }\n" +
                 "    catch (Exception ex) { Log(ex); }\n" +
                 "  }\n" +
                 "  void Log(Exception e) { }\n" +
                 "}\n");
-            var unsupportedBefore = File.ReadAllText(unsupportedPath);
-            var unsupportedRes = RunFix(unsupportedDir, true, allowSourceOnlyFallback: true);
-            var unsupportedAfter = File.ReadAllText(unsupportedPath);
-            bool t21 = unsupportedAfter == unsupportedBefore
-                    && !unsupportedRes.IsComplete
-                    && unsupportedRes.CoverageWarnings.Any(m => m.Contains("미지원 실행 지점"));
-            L($"[21] unsupported execution coverage: {(t21 ? "PASS" : "FAIL")} (unchanged={unsupportedAfter == unsupportedBefore}, warnings={unsupportedRes.CoverageWarnings.Count})");
+            var covBefore = File.ReadAllText(covPath);
+            var covRes = RunFixSourceOnly(covDir, true, allowPartialApplyForSelfTest: true);
+            var covAfter = File.ReadAllText(covPath);
+            bool covNote = covRes.CoverageWarnings.Any(w => w.Contains("foreach") || w.Contains("using"));
+            bool covModified = covAfter != covBefore
+                            && covAfter.Contains("catch (System.FormatException __autoCatchEx)")
+                            && covAfter.Contains("catch (Exception ex)"); // broad fallback 보존
+            bool t21 = covNote && covModified && covRes.Modified >= 1;
+            L("--- CoverageGap.cs (after) ---");
+            L(covAfter);
+            L($"[21] coverage gap 비차단(fix 적용됨): {(t21 ? "PASS" : "FAIL")} (covNote={covNote}, modified={covModified}, Modified={covRes.Modified})");
+
+            // ── [22] classification unit : 커버리지 경고는 IsComplete 를 막지 않고, 무결성 실패는 막는다 ──
+            var r22 = new FixResult();
+            r22.AddCoverageWarning("x");
+            bool t22a = r22.IsComplete; // coverage 만으로는 Complete 유지
+            r22.AddIntegrityFailure("y");
+            bool t22b = !r22.IsComplete; // integrity 추가 시 PARTIAL
+            bool t22 = t22a && t22b;
+            L($"[22] classification (coverage 비차단 / integrity 차단): {(t22 ? "PASS" : "FAIL")} (coverageComplete={t22a}, integrityBlocks={t22b})");
+
+            // ── [23] TOCTOU 가드 : scan 이후 파일이 바뀌면(ExpectedOriginalBytes 불일치) 쓰기 전체 중단 ──
+            var toctouDir = Path.Combine(fixtureDir, "toctou");
+            Directory.CreateDirectory(toctouDir);
+            var toctouPath = Path.Combine(toctouDir, "Toctou.cs");
+            var toctouOriginal = "original content";
+            File.WriteAllText(toctouPath, toctouOriginal);
+            var r23 = new FixResult();
+            r23.PendingWrites.Add(new PendingWrite(toctouPath, "new content", Encoding.UTF8, Encoding.UTF8.GetBytes("DIFFERENT")));
+            ApplyPendingWrites(r23);
+            var toctouAfter = File.ReadAllText(toctouPath);
+            bool t23 = r23.ApplyFailed && toctouAfter == toctouOriginal;
+            L($"[23] TOCTOU 가드(외부 수정 감지→쓰기 중단): {(t23 ? "PASS" : "FAIL")} (applyFailed={r23.ApplyFailed}, unchanged={toctouAfter == toctouOriginal})");
+
+            // ── [24] 해시 일치 시 정상 적용 : ExpectedOriginalBytes == 현재 바이트면 쓰기 성공 ──
+            var okDir = Path.Combine(fixtureDir, "hashok");
+            Directory.CreateDirectory(okDir);
+            var okPath = Path.Combine(okDir, "HashOk.cs");
+            var okOriginal = "original body";
+            File.WriteAllText(okPath, okOriginal, new UTF8Encoding(false));
+            var okBytes = File.ReadAllBytes(okPath);
+            var r24 = new FixResult();
+            r24.PendingWrites.Add(new PendingWrite(okPath, "updated body", new UTF8Encoding(false), okBytes));
+            ApplyPendingWrites(r24);
+            var okAfter = File.ReadAllText(okPath);
+            bool t24 = !r24.ApplyFailed && okAfter == "updated body" && r24.AppliedFileCount == 1;
+            L($"[24] 해시 일치 시 정상 적용: {(t24 ? "PASS" : "FAIL")} (applyFailed={r24.ApplyFailed}, updated={okAfter == "updated body"}, appliedCount={r24.AppliedFileCount})");
 
             allPass = previewUnchanged && t1 && t2 && t3 && t4 && t5 && t6
                    && t7 && t8 && t9 && t10 && t11 && t12
-                   && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21;
+                   && t13 && t14 && t15 && t16 && t17 && t18 && t19 && t20 && t21
+                   && t22 && t23 && t24;
             L(allPass ? "SELFTEST-FIX PASS" : "SELFTEST-FIX FAIL");
         }
         catch (Exception ex)

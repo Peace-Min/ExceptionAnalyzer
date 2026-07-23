@@ -82,15 +82,15 @@ namespace ExceptionAnalyzer
                 {
                     global::Program.WriteFixReport(preview, apply: false);
                     System.Windows.MessageBox.Show(
-                        "일부 프로젝트 또는 문서를 완전히 로드하지 못해 자동수정을 적용하지 않습니다.\n\nfix-report.txt의 WORKSPACE FAILURES와 수동 검토 목록을 먼저 확인하세요.",
-                        "부분 분석 결과 - 적용 차단", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    StatusText.Text = "상태: 미리보기 완료 - 부분 분석이라 적용 차단";
+                        "무결성 문제(워크스페이스/baseline/문서 누락)로 적용을 차단합니다.\n\nfix-report.txt의 INTEGRITY FAILURES와 수동 검토 목록을 먼저 확인하세요.",
+                        "무결성 문제 - 적용 차단", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    StatusText.Text = "상태: 미리보기 완료 - 무결성 문제로 적용 차단";
                     return;
                 }
 
                 // 4) 안내된(informed) 확인 — 미리보기 수치 요약 + 되돌리기 경고
                 var confirm = System.Windows.MessageBox.Show(
-                    $"미리보기 결과:\n\n  수정 예정 catch : {preview.Modified}건\n  수동 검토      : {preview.Skipped_NonTrivial}건\n  완전도        : {(preview.IsComplete ? "Complete" : "PARTIAL — 일부 프로젝트/문서 누락")}\n\n위 미리보기(로그창) 내용대로 소스 파일을 직접 수정합니다.\n되돌리려면 git 등 버전관리가 필요합니다.\n\n적용할까요?",
+                    $"미리보기 결과:\n\n  수정 예정 catch : {preview.Modified}건\n  수동 검토      : {preview.Skipped_NonTrivial}건\n  완전도        : {(preview.IsComplete ? "Complete" : "PARTIAL — 무결성 문제")}\n  커버리지 참고 : {preview.CoverageWarnings.Count}건 (비차단, fallback 보존)\n\n위 미리보기(로그창) 내용대로 소스 파일을 직접 수정합니다.\n되돌리려면 git 등 버전관리가 필요합니다.\n\n적용할까요?",
                     "소스 자동수정 적용", MessageBoxButton.YesNo, MessageBoxImage.Warning);
                 if (confirm != MessageBoxResult.Yes)
                 {
@@ -119,7 +119,10 @@ namespace ExceptionAnalyzer
                         foreach (var m in res.ManualReview) LogBox.AppendText("  " + m + Environment.NewLine);
                     }
                     LogBox.ScrollToEnd();
-                    StatusText.Text = $"상태: 완료 - catch {res.Modified}건 수정, 수동검토 {res.Skipped_NonTrivial}건, 되돌림 {res.CompileReverted}건 (fix-report.txt 생성)";
+                    if (res.ApplyFailed)
+                        StatusText.Text = "상태: 오류 - 저장 실패(롤백 시도됨). fix-report 확인";
+                    else
+                        StatusText.Text = $"상태: 완료 - catch {res.Modified}건 수정, 수동검토 {res.Skipped_NonTrivial}건, 되돌림 {res.CompileReverted}건 (fix-report.txt 생성)";
                 }
                 catch (Exception ex)
                 {
