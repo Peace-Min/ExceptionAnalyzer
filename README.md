@@ -133,7 +133,8 @@ apply는 **파일 단위 best-effort** 입니다 — 문제 있는 파일만 스
 | 외부 라이브러리(DevExpress/Arction/사내 DLL 등) 예외 | XML 문서 없으면 추론 불가 | 동상 |
 | 연산자/변환(checked 오버플로 등) 미수집 | 범위 외 | WS3 |
 | 비자명 catch 본문 | 설계상 수동 검토(원본 로직 보존 우선) | 본문 보존 모드 옵션 후보 |
-| 무결성 문제 파일(baseline 오류/로드 실패)은 그 파일만 스킵 | 깨끗한 파일은 적용, 오염 파일은 `SkippedIntegrityFiles`로 제외(파일 단위 best-effort) | 로드 실패 원인(예: Fody/MSBuildWorkspace 비호환) 개선은 후속 |
+| 무결성 문제 파일(baseline 오류/로드 실패)은 그 파일만 스킵 | 깨끗한 파일은 적용, 오염 파일은 `SkippedIntegrityFiles`로 제외(파일 단위 best-effort) | — |
+| **WPF `<Page>`(컴파일 XAML) 프로젝트의 XAML 접촉 파일** | Roslyn `MSBuildWorkspace`가 design-time build에서 마크업 컴파일(`InitializeComponent`·`x:Name`·`App.Main` 생성)을 안 돌려 CS0103/CS5001 baseline 오류 → 그 파일만 스킵. **XAML 없는 프로젝트·같은 프로젝트의 순수 로직 파일은 정상 적용.** (SDK/VS MSBuild 무관한 Roslyn 라이브러리 한계) | 필요 시 로드 전 마크업 컴파일(`msbuild -t:MarkupCompilePass1`) 선행을 옵트인으로 |
 
 ## 코드 맵 (개발자·에이전트용)
 
